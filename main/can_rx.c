@@ -18,7 +18,7 @@ static const char *TAG = "CAN";
 #define CAN_RX_TASK_PRIO        20
 #define CAN_RX_TASK_CORE        0
 
-#define MA_WINDOW 20
+#define MA_WINDOW 10
 
 static dash_data_t s_data;
 static can_stats_t s_stats;
@@ -35,6 +35,11 @@ static uint32_t s_lastDashMs = 0;
 static uint8_t  s_dashB0 = 0;
 static uint8_t  s_dashB3 = 0;
 static bool     s_dashSeen = false;
+
+uint8_t can_rx_get_fan_mode(void);
+uint8_t can_rx_get_iac_mode(void);
+uint8_t can_rx_get_buzzer_on(void);
+uint8_t can_rx_get_boot_test(void);
 
 static int32_t s_maRpm[MA_WINDOW];
 static int32_t s_maMap[MA_WINDOW];
@@ -194,6 +199,11 @@ static void can_rx_task(void *arg)
             s_data.indL   = dashFresh && (s_dashB0 & 0x01);
             s_data.indR   = dashFresh && (s_dashB0 & 0x02);
             s_data.highBeam = dashFresh && (s_dashB0 & 0x04);
+            s_data.ioboxOk = dashFresh;
+            s_data.fanMode   = can_rx_get_fan_mode();
+            s_data.iacMode   = can_rx_get_iac_mode();
+            s_data.buzzerOn  = can_rx_get_buzzer_on();
+            s_data.bootTestOn = can_rx_get_boot_test();
             s_data.lastRxMs = s_lastRxMs;
             s_data.lastSdbMs = s_lastSdbMs;
 
@@ -351,3 +361,18 @@ uint8_t can_rx_get_gas(void)     { return s_gasPct; }
 static volatile uint16_t s_a4mv = 0xFFFF;
 void can_rx_set_a4mv(uint16_t mv) { s_a4mv = mv; }
 uint16_t can_rx_get_a4mv(void)    { return s_a4mv; }
+
+/* Mode state from B0 v4 telemetry bytes [15..18] */
+static volatile uint8_t s_fanMode = 0;
+static volatile uint8_t s_iacMode = 0;
+static volatile uint8_t s_buzzerOn = 0;
+static volatile uint8_t s_bootTestOn = 0;
+
+void can_rx_set_fan_mode(uint8_t mode)    { s_fanMode = mode; }
+uint8_t can_rx_get_fan_mode(void)        { return s_fanMode; }
+void can_rx_set_iac_mode(uint8_t mode)    { s_iacMode = mode; }
+uint8_t can_rx_get_iac_mode(void)        { return s_iacMode; }
+void can_rx_set_buzzer_on(uint8_t on)     { s_buzzerOn = on; }
+uint8_t can_rx_get_buzzer_on(void)       { return s_buzzerOn; }
+void can_rx_set_boot_test(uint8_t on)     { s_bootTestOn = on; }
+uint8_t can_rx_get_boot_test(void)       { return s_bootTestOn; }

@@ -3,10 +3,10 @@
 #include "can_tx.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_lv_adapter.h"
 #include "nvs.h"
 #include <string.h>
 #include <math.h>
-
 #include "lvgl.h"
 
 static const char *TAG = "UI";
@@ -45,6 +45,16 @@ static lv_obj_t *s_scr_set;
 static lv_obj_t *s_mark_glow;
 static lv_obj_t *s_mark;
 
+/* gauge face: two fully-painted static dials (OEM + classic), each on its own
+ * carrier object. The moving parts (ring, star, labels, bars) are siblings that
+ * sit above both, so only the visible dial swaps. Tap the dial to toggle. */
+#define FACE_CLASSIC 0
+#define FACE_OEM     1
+static lv_obj_t *s_face_oem, *s_face_classic;
+static lv_obj_t *s_face_oem_canvas, *s_face_classic_canvas;
+static int s_face_active = FACE_CLASSIC;
+static bool s_face_dirty = false;   /* face changed; ui_face_persist_once() writes to NVS */
+
 /* star cursor (3-point, pre-rendered canvas) + zone-tinted glow halo */
 #define STARSZ 30
 static int s_mark_sz = STARSZ;
@@ -56,10 +66,12 @@ static uint32_t s_glow_col_prev = 0xFFFFFFFF;
 static lv_obj_t *s_ring_g, *s_ring_a, *s_ring_r;
 
 /* ---- warning banner ----
- * Warn bits mirror iobox3's WarnBit enum (0xB0 frame byte[4] = latched low
- * byte). Box-side latching + hold time provide hysteresis for these; only
- * OVERREV (dash shift cfg) and LEAN (dash AFR math, since box bits 8-9 are
- * truncated away by the single warn byte) get dash-side latches here. */
+ * The dash hears the raw outpc over CAN, so it evaluates the threshold
+ * warnings itself (rpm/clt/mat/batt/map/afr) — that keeps warnings working
+ * even if the ESP-NOW link to the iobox3 drops, and lets RICH surface (the
+ * box's single warn byte truncates bits 8-9). The box warn byte is kept as a
+ * low-priority fallback: its 3s latch catches brief transients the dash's
+ * instantaneous read would miss. Bit numbers mirror iobox3's WarnBit enum. */
 #define WB_IDLE_LO   (1 << 0)
 #define WB_IDLE_HI   (1 << 1)
 #define WB_OVERREV   (1 << 2)
@@ -68,13 +80,16 @@ static lv_obj_t *s_ring_g, *s_ring_a, *s_ring_r;
 #define WB_LOWBATT   (1 << 5)
 #define WB_HIBATT    (1 << 6)
 #define WB_OVERBOOST (1 << 7)
+#define WB_LEAN      (1 << 8)
+#define WB_RICH      (1 << 9)
 
 static lv_obj_t *s_warn_box, *s_warn_lbl;
 static const char *s_warn_cur = "";
-static bool s_ovr_latch, s_lean_latch;
+static bool s_ovr_latch;
 static lv_obj_t *s_val_lbl;
 static lv_obj_t *s_can_lbl;
 static lv_obj_t *s_mat_lbl;
+static lv_obj_t *s_iobox_lbl;
 static lv_obj_t *s_iac_lbl;
 static lv_obj_t *s_idle_lbl;
 static lv_obj_t *s_fan_lbl;
@@ -90,6 +105,15 @@ static lv_obj_t *s_ind_l, *s_ind_r, *s_hb;
 static bool s_indL_on, s_indR_on, s_hb_on;
 static bool s_l_vis, s_r_vis, s_hb_vis;
 
+/* Main screen mode buttons (fan/IAC) */
+static lv_obj_t *s_main_fauto, *s_main_fon, *s_main_foff;
+static lv_obj_t *s_main_iauto, *s_main_ifollow, *s_main_iman;
+
+/* Settings page mode buttons (fan/IAC/buzzer/boot) */
+static lv_obj_t *s_btn_fauto, *s_btn_fon, *s_btn_foff;
+static lv_obj_t *s_btn_iauto, *s_btn_ifollow, *s_btn_iman;
+static lv_obj_t *s_buzz_btn, *s_boot_btn;
+
 /* shift light strip: progressive from SHIFT_START, all flash blue at redline.
  * Thresholds are runtime values persisted in NVS (settings page adjusts them);
  * these defines are only the factory defaults. */
@@ -103,6 +127,40 @@ static bool s_shift_flash = false;
 static const uint32_t kShiftColors[SHIFT_SEGS] = { COL_GOOD, COL_GOOD, COL_WARN, COL_WARN, COL_BAD };
 #define SHIFT_OFF_COLOR 0x1A1A24
 
+/* Accent theme selection + night mode (ported from the old 5-face build).
+ * The accent drives the bezel/major-ticks on both gauge faces plus the cursor
+ * glow/needle; night mode halves it for reduced glare. Persisted in NVS.
+ * s_face_dirty-style flag lets the persist task write to NVS on a real stack. */
+#define THEME_COUNT 4
+static const uint32_t s_theme_colors[THEME_COUNT] = { COL_GOOD, COL_AFR, COL_MAG, COL_BOOST };
+static uint32_t s_accent = COL_GOOD;   /* current accent colour */
+static bool     s_night  = false;      /* reduced-glare night mode */
+static bool     s_theme_dirty = false;      /* theme or night changed; persist pending */
+bool     s_theme_apply_pending = false; /* theme changed; ui_theme_apply_once() needed */
+static lv_obj_t *s_btn_theme[THEME_COUNT];
+static lv_obj_t *s_night_btn;
+static lv_obj_t *s_night_lbl;
+
+/* Dash-side engine-warning thresholds. The dash hears the raw outpc over CAN
+ * directly, so it evaluates the threshold warnings itself (works even if the
+ * ESP-NOW link to the iobox3 drops) and can surface RICH, which the box's
+ * single warn byte truncates away. Defaults mirror the iobox3 engine profile;
+ * tunable via NVS ("dashui" / "w_*") — no settings UI yet. Values are x10
+ * (clt/mat/batt/map) like the rest of the dash data. */
+static int16_t s_warn_clt_max   = 2300;   /* coolant 230 C */
+static int16_t s_warn_mat_max   = 1600;   /* intake  160 C */
+static int16_t s_warn_batt_min  = 110;    /* 11.0 V */
+static int16_t s_warn_batt_max  = 160;    /* 16.0 V */
+static int16_t s_warn_map_max   = 2800;   /* 280 kPa */
+static int16_t s_warn_afr_low   = 100;    /* 10.0 rich */
+static int16_t s_warn_afr_high  = 165;    /* 16.5 lean */
+
+/* gating windows / release margins (avoid banner flapping at the edge) */
+#define WARN_CLT_MIN   100       /* 10 C: ignore pre-warmup garbage */
+#define WARN_MAT_MAX   3000      /* sanity cap on MAT reading */
+#define WARN_BATT_MIN_F 0
+#define WARN_REV_MARGIN 150
+
 static dash_data_t s_prev;
 static int32_t s_last_rpm = -9999;
 
@@ -110,39 +168,65 @@ static const char *warn_evaluate(const dash_data_t *d, uint32_t *color_out, bool
 {
     if (!d->canOk) {
         s_ovr_latch = false;
-        s_lean_latch = false;
         return NULL;
     }
 
     /* OVERREV from the live shift config so banner/strip/ring/glow share one
-     * threshold; release with margin like the demo. */
+     * threshold; release with margin. */
     if (d->rpm >= s_shift_rpm_cfg) s_ovr_latch = true;
-    else if (d->rpm < s_shift_rpm_cfg - 150) s_ovr_latch = false;
-
-    /* LEAN dash-side: afr x10 units, cruise+ only */
-    if (d->afr > 160 && d->rpm > 2500) s_lean_latch = true;
-    else if (d->afr <= 154 || d->rpm < 2500) s_lean_latch = false;
+    else if (d->rpm < s_shift_rpm_cfg - WARN_REV_MARGIN) s_ovr_latch = false;
 
     if (s_ovr_latch) { *color_out = COL_BAD;  *blink_out = true;  return "OVERREV - SHIFT NOW"; }
 
-    /* box-latched bits, priority order first-hit-wins (idle diagnostics
-     * deliberately not shown — warmup would spam IDLE HIGH every cold start) */
-    static const struct { uint8_t bit; const char *txt; uint32_t col; bool blink; } kMap[] = {
+    /* dash-side thresholds straight from the raw outpc. Gate each read window
+     * so power-up / unplug garbage can't trip a false alert. */
+    bool cltOk  = d->clt > WARN_CLT_MIN;
+    bool matOk  = d->mat > 0 && d->mat < WARN_MAT_MAX;
+    bool onThr  = d->tps >= 50;
+    bool battOk = d->batt > 0;
+    bool afrOk  = onThr && d->afr >= 90 && d->afr <= 260;
+    bool mapOk  = d->map > 0 && d->map < 4000;   /* x10 units, sanity window */
+
+    uint16_t ds = 0;
+    if (cltOk  && d->clt  > s_warn_clt_max)  ds |= WB_OVERHEAT;
+    if (matOk  && d->mat  > s_warn_mat_max)  ds |= WB_HOTAIR;
+    if (battOk && d->batt < s_warn_batt_min) ds |= WB_LOWBATT;
+    if (battOk && d->batt > s_warn_batt_max) ds |= WB_HIBATT;
+    if (mapOk  && d->map > s_warn_map_max)   ds |= WB_OVERBOOST;
+    if (afrOk  && d->afr  > s_warn_afr_high) ds |= WB_LEAN;
+    if (afrOk  && d->afr  < s_warn_afr_low)  ds |= WB_RICH;
+
+    /* priority order, first-hit-wins */
+    static const struct { uint16_t bit; const char *txt; uint32_t col; bool blink; } kMap[] = {
         { WB_OVERHEAT,  "OVERHEAT",    COL_WARN, false },
         { WB_OVERBOOST, "OVERBOOST",   COL_BAD,  true  },
         { WB_HOTAIR,    "HOT AIR",     COL_WARN, false },
         { WB_LOWBATT,   "LOW BATTERY", COL_WARN, false },
         { WB_HIBATT,    "HIGH BATT",   COL_WARN, false },
+        { WB_LEAN,      "LEAN",        COL_WARN, true  },
+        { WB_RICH,      "RICH",        COL_WARN, false },
     };
     for (size_t i = 0; i < sizeof(kMap) / sizeof(kMap[0]); i++) {
-        if (d->warnFlags & kMap[i].bit) {
+        if (ds & kMap[i].bit) {
             *color_out = kMap[i].col;
             *blink_out = kMap[i].blink;
             return kMap[i].txt;
         }
     }
 
-    if (s_lean_latch) { *color_out = COL_WARN; *blink_out = true; return "LEAN"; }
+    /* box warn byte as a fallback: iobox3 latches with a 3s hold, catching
+     * brief transients the dash's instant read misses. Only low 8 bits arrive
+     * (LEAN/RICH never in the byte); IDLE bits skipped — warmup would spam
+     * IDLE HIGH every cold start. */
+    uint8_t box = d->warnFlags & ~(WB_IDLE_LO | WB_IDLE_HI | WB_OVERREV);
+    for (size_t i = 0; i < sizeof(kMap) / sizeof(kMap[0]); i++) {
+        if ((uint8_t)kMap[i].bit && (box & (uint8_t)kMap[i].bit)) {
+            *color_out = kMap[i].col;
+            *blink_out = kMap[i].blink;
+            return kMap[i].txt;
+        }
+    }
+
     return NULL;
 }
 
@@ -190,13 +274,21 @@ static void settings_iac_target_minus_evt(lv_event_t *e);
 static void settings_iac_target_plus_evt(lv_event_t *e);
 static void settings_fan_on_minus_evt(lv_event_t *e);
 static void settings_fan_on_plus_evt(lv_event_t *e);
+static void settings_fan_off_minus_evt(lv_event_t *e);
+static void settings_fan_off_plus_evt(lv_event_t *e);
 static void settings_shift_minus_evt(lv_event_t *e);
+static void update_fan_mode_buttons(uint8_t mode);
+static void update_iac_mode_buttons(uint8_t mode);
+static void update_buzzer_button(bool on);
+static void update_boot_button(bool on);
 static void settings_shift_plus_evt(lv_event_t *e);
 static void settings_duty_minus_evt(lv_event_t *e);
 static void settings_duty_plus_evt(lv_event_t *e);
 static void settings_buzz_evt(lv_event_t *e);
 static void settings_beep_evt(lv_event_t *e);
 static void settings_boot_evt(lv_event_t *e);
+
+static void face_toggle_evt(lv_event_t *e);
 
 #define DEG2RAD(d) ((d) * 3.14159265f / 180.0f)
 
@@ -245,6 +337,13 @@ static void face_arc(lv_layer_t *layer, int cx, int cy, int r,
     lv_draw_arc(layer, &d);
 }
 
+/* face selector: 1 = OEM/factory look (ported from the old 5-face build),
+ * 0 = classic neon. */
+static uint32_t accent_live(void) {
+    if (!s_night) return s_accent;
+    return (s_accent >> 1) & 0x7F7F7F;
+}
+
 static void gauge_paint_classic(lv_obj_t *parent) {
     int cx = GAUGE_CX, cy = GAUGE_CY, r = GAUGE_R;
     int sz = r * 2 + 20;
@@ -258,6 +357,7 @@ static void gauge_paint_classic(lv_obj_t *parent) {
     lv_canvas_set_buffer(canvas, fbuf, sz, sz, LV_COLOR_FORMAT_RGB565);
     lv_canvas_fill_bg(canvas, lv_color_hex(COL_BG), LV_OPA_COVER);
     lv_obj_set_pos(canvas, cx - sz / 2, cy - sz / 2);
+    s_face_classic_canvas = canvas;
 
     lv_layer_t layer;
     lv_canvas_init_layer(canvas, &layer);
@@ -284,7 +384,7 @@ static void gauge_paint_classic(lv_obj_t *parent) {
     }
 
     /* theme-colored bezel ring */
-    face_arc(&layer, ox, oy, r, 0, 360, COL_GOOD, 2, LV_OPA_50);
+    face_arc(&layer, ox, oy, r, 0, 360, accent_live(), 2, LV_OPA_50);
 
     /* minor ticks (every 6 degrees) */
     for (int a = (int)GAUGE_A0; a <= (int)GAUGE_A1; a += 6)
@@ -292,7 +392,7 @@ static void gauge_paint_classic(lv_obj_t *parent) {
 
     /* major ticks (every 25%) */
     for (int p = 0; p <= 100; p += 25)
-        face_line(&layer, ox, oy, gauge_angle((float)p), (int)(r * 0.70f), (int)(r * 0.92f), COL_GOOD, 2);
+        face_line(&layer, ox, oy, gauge_angle((float)p), (int)(r * 0.70f), (int)(r * 0.92f), accent_live(), 2);
 
     /* scale numbers */
     static const char *scale_txt[] = {"0", "1k", "2k", "3k", "4k", "5k", "6k", "7k", "8k"};
@@ -313,6 +413,91 @@ static void gauge_paint_classic(lv_obj_t *parent) {
     }
 
     lv_canvas_finish_layer(canvas, &layer);
+}
+
+/* OEM / factory look: neutral white ticks, hairline bezel, thin redline arc.
+ * Ported from the old 5-face reference build; stays neutral (no theme).
+ * Redline/warn arcs derive from the live NVS shift setting like the ring. */
+static void gauge_paint_oem(lv_obj_t *parent) {
+    int cx = GAUGE_CX, cy = GAUGE_CY, r = GAUGE_R;
+    int sz = r * 2 + 20;
+
+    size_t fbytes = (size_t)sz * sz * 2 + 64;
+    void *fbuf = heap_caps_malloc(fbytes, MALLOC_CAP_SPIRAM);
+    if (!fbuf) fbuf = malloc(fbytes);
+    lv_obj_t *canvas = lv_canvas_create(parent);
+    lv_obj_remove_style_all(canvas);
+    lv_canvas_set_buffer(canvas, fbuf, sz, sz, LV_COLOR_FORMAT_RGB565);
+    lv_canvas_fill_bg(canvas, lv_color_hex(COL_BG), LV_OPA_COVER);
+    lv_obj_set_pos(canvas, cx - sz / 2, cy - sz / 2);
+    s_face_oem_canvas = canvas;
+
+    lv_layer_t layer;
+    lv_canvas_init_layer(canvas, &layer);
+
+    int ox = sz / 2, oy = sz / 2;
+
+    /* hairline arc rail the needle rides on */
+    face_arc(&layer, ox, oy, (int)(r * 0.78f), GAUGE_A0, GAUGE_A1, 0xD8D8E0, 1, LV_OPA_80);
+
+    /* thin factory redline arc: band + crisp edge (not a fat block) */
+    int32_t red = s_shift_rpm_cfg;
+    int32_t warn = red - SHIFT_START_GAP;
+    if (warn < RPM_MIN) warn = RPM_MIN;
+    float rpct = gauge_pct_rpm(red);
+    float wpct = gauge_pct_rpm(warn);
+    int ra0 = (int)gauge_angle(rpct);
+    face_arc(&layer, ox, oy, (int)(r * 0.78f), ra0, GAUGE_A1, COL_BAD, (int)(r * 0.08f), LV_OPA_50);
+    face_arc(&layer, ox, oy, (int)(r * 0.78f), ra0, GAUGE_A1, COL_BAD, 2, LV_OPA_90);
+
+    /* thin amber warnline arc, just inside */
+    face_arc(&layer, ox, oy, (int)(r * 0.72f), gauge_angle(wpct), gauge_angle(rpct),
+             COL_WARN, 2, LV_OPA_80);
+
+    /* white minor + major ticks */
+    for (int a = (int)GAUGE_A0; a <= (int)GAUGE_A1; a += 5)
+        face_line(&layer, ox, oy, (float)a, (int)(r * 0.80f), (int)(r * 0.88f), 0xD8D8E0, 1);
+    for (int p = 0; p <= 100; p += 25)
+        face_line(&layer, ox, oy, gauge_angle((float)p), (int)(r * 0.80f), (int)(r * 0.92f), accent_live(), 2);
+
+    /* hairline bezel */
+    face_arc(&layer, ox, oy, r, 0, 360, accent_live(), 1, LV_OPA_90);
+
+    /* scale numbers, OEM-neutral */
+    static const char *scale_txt[] = {"0", "1k", "2k", "3k", "4k", "5k", "6k", "7k", "8k"};
+    static const int scale_pct[] = {0, 11, 22, 33, 44, 56, 67, 78, 89};
+    int lr = (int)(r * 0.58f);
+    for (int i = 0; i < 9; i++) {
+        float a = gauge_angle((float)scale_pct[i]);
+        float rad = DEG2RAD(a);
+        int lx = (int)(ox + lr * cosf(rad));
+        int ly = (int)(oy + lr * sinf(rad));
+        lv_obj_t *l = lv_label_create(parent);
+        lv_label_set_text(l, scale_txt[i]);
+        lv_obj_set_style_text_color(l, lv_color_hex(0xD8D8E0), 0);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+        lv_obj_set_width(l, 28);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(l, (cx - sz / 2) + lx - 14, (cy - sz / 2) + ly - 8);
+    }
+
+    lv_canvas_finish_layer(canvas, &layer);
+}
+
+/* Re-paint the active gauge face after an accent/night change. The accent is baked
+ * into each static dial canvas. We only repaint the VISIBLE face immediately; the
+ * hidden face is marked dirty and repainted on next face toggle (so it's ready
+ * when shown). This keeps the per-frame LVGL work under the watchdog budget. */
+static void ui_theme_apply(void) {
+    if (s_face_active == FACE_OEM) {
+        if (s_face_oem_canvas) { lv_obj_del(s_face_oem_canvas); s_face_oem_canvas = NULL; }
+        gauge_paint_oem(s_face_oem);
+        s_face_dirty = true;
+    } else {
+        if (s_face_classic_canvas) { lv_obj_del(s_face_classic_canvas); s_face_classic_canvas = NULL; }
+        gauge_paint_classic(s_face_classic);
+        s_face_dirty = true;
+    }
 }
 
 static void create_bar(lv_obj_t **track, lv_obj_t **fill, lv_obj_t **name_lbl,
@@ -530,8 +715,25 @@ static void ui_init_main_build(void) {
     lv_obj_set_style_bg_color(s_scr_main, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_bg_opa(s_scr_main, LV_OPA_COVER, 0);
 
-    /* gauge face drawn on canvas (static, zero per-frame cost) */
-    gauge_paint_classic(s_scr_main);
+    /* two gauge faces: each a fully-painted static dial on its own carrier.
+     * The moving parts below (ring, star, labels, bars) are siblings layered
+     * above both, so tap-to-toggle only swaps the dial background. */
+    s_face_oem = lv_obj_create(s_scr_main);
+    lv_obj_remove_style_all(s_face_oem);
+    lv_obj_set_size(s_face_oem, 800, 480);
+    lv_obj_set_pos(s_face_oem, 0, 0);
+    gauge_paint_oem(s_face_oem);
+
+    s_face_classic = lv_obj_create(s_scr_main);
+    lv_obj_remove_style_all(s_face_classic);
+    lv_obj_set_size(s_face_classic, 800, 480);
+    lv_obj_set_pos(s_face_classic, 0, 0);
+    gauge_paint_classic(s_face_classic);
+
+    if (s_face_active == FACE_OEM)
+        lv_obj_add_flag(s_face_classic, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(s_face_oem, LV_OBJ_FLAG_HIDDEN);
 
     /* load-up ring: 3 stacked zone arcs (green/amber/red), end angle advances
      * with rpm like a shift indicator filling up. Zero-span until first update. */
@@ -650,6 +852,20 @@ static void ui_init_main_build(void) {
     lv_obj_set_style_text_font(s_mat_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_pos(s_mat_lbl, 700, 8);
 
+    /* iobox3 link-health chip (top-left): BOX OK when the ESP-NOW link is
+     * alive, BOX LOST when the box goes silent. CAN can be fine while the box
+     * is dead, so this is the only direct proof the box is on the link. */
+    s_iobox_lbl = lv_label_create(s_scr_main);
+    lv_label_set_text(s_iobox_lbl, "BOX LOST");
+    lv_obj_set_style_text_color(s_iobox_lbl, lv_color_hex(0x0A0A10), 0);
+    lv_obj_set_style_bg_color(s_iobox_lbl, lv_color_hex(COL_BAD), 0);
+    lv_obj_set_style_bg_opa(s_iobox_lbl, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_iobox_lbl, 3, 0);
+    lv_obj_set_style_pad_ver(s_iobox_lbl, 2, 0);
+    lv_obj_set_style_pad_hor(s_iobox_lbl, 6, 0);
+    lv_obj_set_style_text_font(s_iobox_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(s_iobox_lbl, 10, 8);
+
     /* bar gauges */
     create_bar(&s_map_track, &s_map_fill, &s_map_lbl, &s_map_val,
                s_scr_main, 10, 44, 48, 120, "MAP", COL_BOOST);
@@ -752,60 +968,60 @@ static void ui_init_main_build(void) {
     lv_style_set_text_color(&btn_style_on, lv_color_hex(0x0A0A10));
 
     /* Fan controls row */
-    lv_obj_t *fan_auto = lv_btn_create(s_scr_main);
-    lv_obj_add_style(fan_auto, &btn_style, 0);
-    lv_obj_set_size(fan_auto, 100, 40);
-    lv_obj_set_pos(fan_auto, 10, 438);
-    lv_obj_t *fan_auto_lbl = lv_label_create(fan_auto);
+    s_main_fauto = lv_btn_create(s_scr_main);
+    lv_obj_add_style(s_main_fauto, &btn_style, 0);
+    lv_obj_set_size(s_main_fauto, 100, 40);
+    lv_obj_set_pos(s_main_fauto, 10, 438);
+    lv_obj_t *fan_auto_lbl = lv_label_create(s_main_fauto);
     lv_label_set_text(fan_auto_lbl, "FAN AUTO");
     lv_obj_center(fan_auto_lbl);
-    lv_obj_add_event_cb(fan_auto, fan_auto_evt, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_main_fauto, fan_auto_evt, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *fan_on = lv_btn_create(s_scr_main);
-    lv_obj_add_style(fan_on, &btn_style, 0);
-    lv_obj_set_size(fan_on, 80, 40);
-    lv_obj_set_pos(fan_on, 120, 438);
-    lv_obj_t *fan_on_lbl = lv_label_create(fan_on);
+    s_main_fon = lv_btn_create(s_scr_main);
+    lv_obj_add_style(s_main_fon, &btn_style, 0);
+    lv_obj_set_size(s_main_fon, 80, 40);
+    lv_obj_set_pos(s_main_fon, 120, 438);
+    lv_obj_t *fan_on_lbl = lv_label_create(s_main_fon);
     lv_label_set_text(fan_on_lbl, "FAN ON");
     lv_obj_center(fan_on_lbl);
-    lv_obj_add_event_cb(fan_on, fan_on_evt, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_main_fon, fan_on_evt, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *fan_off = lv_btn_create(s_scr_main);
-    lv_obj_add_style(fan_off, &btn_style, 0);
-    lv_obj_set_size(fan_off, 80, 40);
-    lv_obj_set_pos(fan_off, 210, 438);
-    lv_obj_t *fan_off_lbl = lv_label_create(fan_off);
+    s_main_foff = lv_btn_create(s_scr_main);
+    lv_obj_add_style(s_main_foff, &btn_style, 0);
+    lv_obj_set_size(s_main_foff, 80, 40);
+    lv_obj_set_pos(s_main_foff, 210, 438);
+    lv_obj_t *fan_off_lbl = lv_label_create(s_main_foff);
     lv_label_set_text(fan_off_lbl, "FAN OFF");
     lv_obj_center(fan_off_lbl);
-    lv_obj_add_event_cb(fan_off, fan_off_evt, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_main_foff, fan_off_evt, LV_EVENT_CLICKED, NULL);
 
     /* IAC controls row */
-    lv_obj_t *iac_auto = lv_btn_create(s_scr_main);
-    lv_obj_add_style(iac_auto, &btn_style, 0);
-    lv_obj_set_size(iac_auto, 100, 40);
-    lv_obj_set_pos(iac_auto, 310, 438);
-    lv_obj_t *iac_auto_lbl = lv_label_create(iac_auto);
+    s_main_iauto = lv_btn_create(s_scr_main);
+    lv_obj_add_style(s_main_iauto, &btn_style, 0);
+    lv_obj_set_size(s_main_iauto, 100, 40);
+    lv_obj_set_pos(s_main_iauto, 310, 438);
+    lv_obj_t *iac_auto_lbl = lv_label_create(s_main_iauto);
     lv_label_set_text(iac_auto_lbl, "IAC AUTO");
     lv_obj_center(iac_auto_lbl);
-    lv_obj_add_event_cb(iac_auto, iac_auto_evt, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_main_iauto, iac_auto_evt, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *iac_follow = lv_btn_create(s_scr_main);
-    lv_obj_add_style(iac_follow, &btn_style, 0);
-    lv_obj_set_size(iac_follow, 100, 40);
-    lv_obj_set_pos(iac_follow, 420, 438);
-    lv_obj_t *iac_follow_lbl = lv_label_create(iac_follow);
+    s_main_ifollow = lv_btn_create(s_scr_main);
+    lv_obj_add_style(s_main_ifollow, &btn_style, 0);
+    lv_obj_set_size(s_main_ifollow, 100, 40);
+    lv_obj_set_pos(s_main_ifollow, 420, 438);
+    lv_obj_t *iac_follow_lbl = lv_label_create(s_main_ifollow);
     lv_label_set_text(iac_follow_lbl, "IAC FOLLOW");
     lv_obj_center(iac_follow_lbl);
-    lv_obj_add_event_cb(iac_follow, iac_follow_evt, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_main_ifollow, iac_follow_evt, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *iac_man = lv_btn_create(s_scr_main);
-    lv_obj_add_style(iac_man, &btn_style, 0);
-    lv_obj_set_size(iac_man, 80, 40);
-    lv_obj_set_pos(iac_man, 530, 438);
-    lv_obj_t *iac_man_lbl = lv_label_create(iac_man);
+    s_main_iman = lv_btn_create(s_scr_main);
+    lv_obj_add_style(s_main_iman, &btn_style, 0);
+    lv_obj_set_size(s_main_iman, 80, 40);
+    lv_obj_set_pos(s_main_iman, 530, 438);
+    lv_obj_t *iac_man_lbl = lv_label_create(s_main_iman);
     lv_label_set_text(iac_man_lbl, "IAC MAN");
     lv_obj_center(iac_man_lbl);
-    lv_obj_add_event_cb(iac_man, iac_man_evt, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_main_iman, iac_man_evt, LV_EVENT_CLICKED, NULL);
 
     /* SETTINGS button (navigate to iobox3 settings page) */
     lv_obj_t *btn_set = lv_btn_create(s_scr_main);
@@ -817,10 +1033,73 @@ static void ui_init_main_build(void) {
     lv_obj_center(l);
     lv_obj_add_event_cb(btn_set, settings_show_evt, LV_EVENT_CLICKED, NULL);
 
+    /* transparent tap-zone over the dial: tap to swap between the OEM and
+     * classic faces. Sits on top (transparent, no paint) but only covers the
+     * gauge, never the bottom button row. */
+    lv_obj_t *face_zone = lv_obj_create(s_scr_main);
+    lv_obj_remove_style_all(face_zone);
+    lv_obj_set_size(face_zone, 420, 420);
+    lv_obj_set_pos(face_zone, GAUGE_CX - 210, GAUGE_CY - 210);
+    lv_obj_add_flag(face_zone, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(face_zone, face_toggle_evt, LV_EVENT_CLICKED, NULL);
+
     ESP_LOGI(TAG, "Main UI built (not shown)");
     memset(&s_prev, 0, sizeof(s_prev));
 }
 
+static void face_toggle_evt(lv_event_t *e) {
+    (void)e;
+    if (s_face_active == FACE_OEM) {
+        s_face_active = FACE_CLASSIC;
+        lv_obj_clear_flag(s_face_classic, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_face_oem, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        s_face_active = FACE_OEM;
+        lv_obj_clear_flag(s_face_oem, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_face_classic, LV_OBJ_FLAG_HIDDEN);
+    }
+    /* Do NOT flash-write from this LVGL event handler — the NVS commit's
+     * cache-freeze path overflows the LVGL task stack (assert). Just flag it;
+     * a dedicated task (ui_face_persist_once) does the actual NVS write. */
+    s_face_dirty = true;
+}
+
+/* Called from a dedicated (non-LVGL) task so the NVS flash commit runs on a
+ * real stack. Flash write outside the touch/render context is safe. */
+void ui_face_persist_once(void)
+{
+    if (!s_face_dirty && !s_theme_dirty) return;
+    nvs_handle_t h;
+    if (nvs_open("dashui", NVS_READWRITE, &h) == ESP_OK) {
+        if (s_face_dirty) {
+            nvs_set_i32(h, "face", s_face_active);
+            s_face_dirty = false;
+        }
+        if (s_theme_dirty) {
+            nvs_set_i32(h, "accent", (int32_t)s_accent);
+            nvs_set_i32(h, "night",  s_night ? 1 : 0);
+            s_theme_dirty = false;
+        }
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+void ui_theme_apply_once(void)
+{
+    if (s_theme_apply_pending) {
+        s_theme_apply_pending = false;
+        ui_theme_apply();
+    }
+}
+
+
+/* Mode buttons send the command and let the iobox3 echo its new state back
+ * over the link; the highlight is then driven by that echo in ui_update().
+ * We deliberately DO NOT highlight locally on press — if the command is lost
+ * or the link drops, a local highlight would stick on the pressed (wrong)
+ * mode forever because the diff-guard in ui_update() can't see a change to
+ * correct it. Box-echoed state is the single source of truth. */
 static void fan_auto_evt(lv_event_t *e) {
     (void)e;
     can_tx_fan_auto(true);
@@ -861,23 +1140,20 @@ static void ui_init_main_show(void) {
  * Settings page (iobox3 control)
  * ============================================================================ */
 
-static lv_obj_t *s_btn_fauto, *s_btn_fon, *s_btn_foff;
-static lv_obj_t *s_btn_iauto, *s_btn_ifollow, *s_btn_iman;
-
-/* right-column/left-column tracked values (dash-side assumption until first
- * press — the iobox has no read-back channel) */
 static int16_t  s_shift_rpm_val  = SHIFT_RPM_DEFAULT;
 static int8_t   s_iac_duty_val   = 50;
-static bool     s_buzz_on        = true;
-static bool     s_boottest_on    = true;
+static bool     s_buzz_on        = false;
+static bool     s_boottest_on    = false;
 static int16_t  s_iac_target_val = 900;    /* rpm */
 static int16_t  s_fan_on_val     = 2000;   /* F x10 */
+static int16_t  s_fan_off_val    = 1900;   /* F x10 */
 static lv_obj_t *s_shift_val_lbl, *s_duty_val_lbl, *s_buzz_lbl, *s_boot_lbl;
+static lv_obj_t *s_buzz_btn, *s_boot_btn;
 static lv_obj_t *s_gas_lbl, *s_gdamp_val_lbl, *s_glow_val_lbl;
 static lv_timer_t *s_gas_timer;
 static int16_t s_gdamp_val = 0;   /* mirror of box gasDamp */
 static int16_t s_glow_val  = 20;  /* mirror of box lowFuelPct */
-static lv_obj_t *s_tgt_val_lbl, *s_fanon_val_lbl;
+static lv_obj_t *s_tgt_val_lbl, *s_fanon_val_lbl, *s_fanoff_val_lbl;
 
 /* NVS persistence for dash-side settings ("dashui" namespace).
  * app_main calls nvs_flash_init() before ui_init(), so this is safe. */
@@ -887,6 +1163,27 @@ static void settings_nvs_load(void) {
         int32_t v = 0;
         if (nvs_get_i32(h, "shift_rpm", &v) == ESP_OK && v >= 4000 && v <= 9000)
             s_shift_rpm_cfg = v;
+        if (nvs_get_i32(h, "w_clt", &v) == ESP_OK && v >= 1000 && v <= 2600)
+            s_warn_clt_max = v;
+        if (nvs_get_i32(h, "w_mat", &v) == ESP_OK && v >= 500 && v <= 3000)
+            s_warn_mat_max = v;
+        if (nvs_get_i32(h, "w_battlo", &v) == ESP_OK && v >= 80 && v <= 150)
+            s_warn_batt_min = v;
+        if (nvs_get_i32(h, "w_batthi", &v) == ESP_OK && v >= 120 && v <= 200)
+            s_warn_batt_max = v;
+        if (nvs_get_i32(h, "w_map", &v) == ESP_OK && v >= 1500 && v <= 4000)
+            s_warn_map_max = v;
+        if (nvs_get_i32(h, "w_afrlo", &v) == ESP_OK && v >= 80 && v <= 140)
+            s_warn_afr_low = v;
+        if (nvs_get_i32(h, "w_afrhi", &v) == ESP_OK && v >= 120 && v <= 220)
+            s_warn_afr_high = v;
+        if (nvs_get_i32(h, "face", &v) == ESP_OK && (v == FACE_CLASSIC || v == FACE_OEM))
+            s_face_active = v;
+        if (nvs_get_i32(h, "accent", &v) == ESP_OK)
+            for (int i = 0; i < THEME_COUNT; i++)
+                if ((uint32_t)v == s_theme_colors[i]) { s_accent = (uint32_t)v; break; }
+        if (nvs_get_i32(h, "night", &v) == ESP_OK && v >= 0 && v <= 1)
+            s_night = (v == 1);
         nvs_close(h);
     }
 }
@@ -905,14 +1202,28 @@ static void settings_back_evt(lv_event_t *e) {
     lv_scr_load_anim(s_scr_main, LV_SCR_LOAD_ANIM_FADE_IN, 300, 0, true);
 }
 
-/* auto_del on the back animation frees the settings screen — clear the
- * pointer exactly when that happens, or the next ui_show_settings()
- * loads freed memory */
+/* auto_del on the back animation frees the settings screen (and all its child
+ * widgets). Clear EVERY pointer into that object exactly when the deletion
+ * happens, or the next ui_update() dereferences freed memory: the fan/IAC
+ * mode highlights call update_*_mode_buttons() every time the box reports a
+ * mode change, and those touch the settings child buttons directly. Clearing
+ * only s_scr_set left these dangling -> use-after-free on the frame after the
+ * 300ms fade completes. Rebuilt lazily next ui_show_settings(). */
 static void scr_set_delete_evt(lv_event_t *e) {
     (void)e;
     s_scr_set = NULL;
     if (s_gas_timer) { lv_timer_del(s_gas_timer); s_gas_timer = NULL; }
+
+    s_btn_fauto = NULL; s_btn_fon = NULL; s_btn_foff = NULL;
+    s_btn_iauto = NULL; s_btn_ifollow = NULL; s_btn_iman = NULL;
+    s_buzz_btn = NULL; s_boot_btn = NULL;
+    s_buzz_lbl = NULL; s_boot_lbl = NULL;
+    s_shift_val_lbl = NULL; s_duty_val_lbl = NULL;
+    s_gdamp_val_lbl = NULL; s_glow_val_lbl = NULL;
     s_gas_lbl = NULL;
+    s_tgt_val_lbl = NULL; s_fanon_val_lbl = NULL; s_fanoff_val_lbl = NULL;
+    for (int i = 0; i < THEME_COUNT; i++) s_btn_theme[i] = NULL;
+    s_night_btn = NULL; s_night_lbl = NULL;
 }
 
 /* Fuel calibration — sends Q <slot> to iobox3 over the link; box records its
@@ -924,6 +1235,46 @@ static void settings_gas_set_evt(lv_event_t *e) {
     uintptr_t idx = (uintptr_t)lv_event_get_user_data(e);
     if (idx < 5) can_tx_gas_record(kGasSlots[idx]);
 }
+
+/* Accent theme picker + night toggle (dash-side, persisted to NVS). */
+static void theme_highlight(void);
+
+static void theme_evt(lv_event_t *e) {
+    uint32_t c = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    if (c == s_accent) return;
+    s_accent = c;
+    s_theme_dirty = true;
+    s_theme_apply_pending = true;
+    theme_highlight();
+}
+
+static void night_evt(lv_event_t *e) {
+    (void)e;
+    s_night = !s_night;
+    s_theme_dirty = true;
+    s_theme_apply_pending = true;
+    theme_highlight();
+}
+
+/* Repaint the 4 theme swatches + night button to reflect s_accent/s_night.
+ * Called from the evt handlers and on settings page show. */
+static void theme_highlight(void) {
+    for (int i = 0; i < THEME_COUNT; i++) {
+        if (!s_btn_theme[i]) continue;
+        bool act = (s_accent == s_theme_colors[i]);
+        uint32_t c = s_theme_colors[i];
+        lv_obj_set_style_bg_color(s_btn_theme[i],
+            lv_color_hex(act ? c : ((c >> 2) & 0x3F3F3F)), 0);
+        lv_obj_set_style_border_width(s_btn_theme[i], act ? 2 : 0, 0);
+        lv_obj_set_style_border_color(s_btn_theme[i], lv_color_hex(COL_TEXT), 0);
+    }
+    if (s_night_btn && s_night_lbl) {
+        lv_obj_set_style_bg_color(s_night_btn,
+            lv_color_hex(s_night ? COL_GOOD : 0x2A2A3A), 0);
+        lv_label_set_text(s_night_lbl, s_night ? "NIGHT ON" : "NIGHT OFF");
+    }
+}
+
 
 static void settings_gdamp_evt(lv_event_t *e) {
     int d = (int)(intptr_t)lv_event_get_user_data(e);
@@ -994,6 +1345,19 @@ static void settings_fan_on_step(int16_t d) {
 static void settings_fan_on_minus_evt(lv_event_t *e) { (void)e; settings_fan_on_step(-10); }
 static void settings_fan_on_plus_evt(lv_event_t *e)  { (void)e; settings_fan_on_step(10); }
 
+static void settings_fan_off_step(int16_t d) {
+    int v = s_fan_off_val + d;
+    if (v < 1000) v = 1000;   /* 100.0F */
+    if (v > 2400) v = 2400;   /* 240.0F */
+    s_fan_off_val = (int16_t)v;
+    can_tx_fan_off_temp(s_fan_off_val);
+    char buf[16];
+    lv_snprintf(buf, sizeof(buf), "%d.%dF", s_fan_off_val / 10, s_fan_off_val % 10);
+    lv_label_set_text(s_fanoff_val_lbl, buf);
+}
+static void settings_fan_off_minus_evt(lv_event_t *e) { (void)e; settings_fan_off_step(-10); }
+static void settings_fan_off_plus_evt(lv_event_t *e)  { (void)e; settings_fan_off_step(10); }
+
 static void settings_shift_step(int16_t d) {
     s_shift_rpm_val += d;
     if (s_shift_rpm_val < 4000) s_shift_rpm_val = 4000;
@@ -1023,25 +1387,21 @@ static void settings_duty_plus_evt(lv_event_t *e)  { (void)e; settings_duty_step
 
 static void settings_buzz_evt(lv_event_t *e) {
     (void)e;
-    s_buzz_on = !s_buzz_on;
-    can_tx_buzzer(s_buzz_on);
-    lv_label_set_text(s_buzz_lbl, s_buzz_on ? "BUZZER ON" : "BUZZER OFF");
+    /* Send the opposite of the iobox3's ACTUAL state (box echo is truth), not
+     * a stale local flag — so the toggle always flips the real mode. No local
+     * highlight here; ui_update() re-highlights from the box echo. */
+    bool want = !can_rx_get_buzzer_on();
+    s_buzz_on = want;
+    can_tx_buzzer(want);
 }
-static void settings_beep_evt(lv_event_t *e) { (void)e; can_tx_buzzer_test(); }
 
-static void settings_led_evt(lv_event_t *e) {
-    const char *preset = (const char *)lv_event_get_user_data(e);
-    if (strcmp(preset, "off") == 0)      can_tx_led_off();
-    else if (strcmp(preset, "red") == 0) can_tx_led(255, 0, 0);
-    else if (strcmp(preset, "blue") == 0) can_tx_led(40, 80, 255);
-    else                                 can_tx_led(255, 120, 20);  /* amber */
-}
+static void settings_beep_evt(lv_event_t *e) { (void)e; can_tx_buzzer_test(); }
 
 static void settings_boot_evt(lv_event_t *e) {
     (void)e;
-    s_boottest_on = !s_boottest_on;
-    can_tx_boottest(s_boottest_on);
-    lv_label_set_text(s_boot_lbl, s_boottest_on ? "BOOT TEST ON" : "BOOT TEST OFF");
+    bool want = !can_rx_get_boot_test();
+    s_boottest_on = want;
+    can_tx_boottest(want);
 }
 
 static void settings_show_evt(lv_event_t *e) {
@@ -1051,6 +1411,11 @@ static void settings_show_evt(lv_event_t *e) {
 
 static void build_settings(void) {
     s_shift_rpm_val = (int16_t)s_shift_rpm_cfg;   /* reflect persisted value on rebuild */
+    /* Sync buzzer/boot-test to the iobox3's actual state (box echo is truth);
+     * the settings page must not pretend they're ON just because the local
+     * default is ON — the box defaults OFF and stays quiet. */
+    s_buzz_on      = can_rx_get_buzzer_on()  ? true : false;
+    s_boottest_on  = can_rx_get_boot_test()  ? true : false;
     s_scr_set = lv_obj_create(NULL);
     lv_obj_remove_style_all(s_scr_set);
     lv_obj_set_style_bg_color(s_scr_set, lv_color_hex(COL_BG), 0);
@@ -1210,6 +1575,61 @@ static void build_settings(void) {
 
     y += 80;
 
+    /* Fan OFF temp (hysteresis) */
+    lbl = lv_label_create(s_scr_set);
+    lv_label_set_text(lbl, "FAN OFF TEMP (F)");
+    lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
+    lv_obj_set_pos(lbl, 10, y);
+
+    lv_obj_t *f_off_minus = lv_btn_create(s_scr_set);
+    lv_obj_add_style(f_off_minus, &btn_style, 0);
+    lv_obj_set_size(f_off_minus, 50, 40);
+    lv_obj_set_pos(f_off_minus, 10, y + 24);
+    l = lv_label_create(f_off_minus);
+    lv_label_set_text(l, "-10");
+    lv_obj_center(l);
+    lv_obj_add_event_cb(f_off_minus, settings_fan_off_minus_evt, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *f_off_plus = lv_btn_create(s_scr_set);
+    lv_obj_add_style(f_off_plus, &btn_style, 0);
+    lv_obj_set_size(f_off_plus, 50, 40);
+    lv_obj_set_pos(f_off_plus, 70, y + 24);
+    l = lv_label_create(f_off_plus);
+    lv_label_set_text(l, "+10");
+    lv_obj_center(l);
+    lv_obj_add_event_cb(f_off_plus, settings_fan_off_plus_evt, LV_EVENT_CLICKED, NULL);
+
+    s_fanoff_val_lbl = lv_label_create(s_scr_set);
+    lv_snprintf(buf, sizeof(buf), "%d.%dF", s_fan_off_val / 10, s_fan_off_val % 10);
+    lv_label_set_text(s_fanoff_val_lbl, buf);
+    lv_obj_set_style_text_color(s_fanoff_val_lbl, lv_color_hex(COL_TEXT), 0);
+    lv_obj_set_pos(s_fanoff_val_lbl, 135, y + 34);
+
+    y += 80;
+
+    /* Accent theme picker + night toggle (left column bottom, below FAN OFF) */
+    lbl = lv_label_create(s_scr_set);
+    lv_label_set_text(lbl, "ACCENT");
+    lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
+    lv_obj_set_pos(lbl, 10, 426);
+    for (int i = 0; i < THEME_COUNT; i++) {
+        s_btn_theme[i] = lv_btn_create(s_scr_set);
+        lv_obj_add_style(s_btn_theme[i], &btn_style, 0);
+        lv_obj_set_size(s_btn_theme[i], 44, 28);
+        lv_obj_set_pos(s_btn_theme[i], 10 + i * 48, 448);
+        lv_obj_add_event_cb(s_btn_theme[i], theme_evt, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)s_theme_colors[i]);
+    }
+    s_night_btn = lv_btn_create(s_scr_set);
+    lv_obj_add_style(s_night_btn, &btn_style, 0);
+    lv_obj_set_size(s_night_btn, 100, 28);
+    lv_obj_set_pos(s_night_btn, 10 + THEME_COUNT * 48 + 16, 448);
+    s_night_lbl = lv_label_create(s_night_btn);
+    lv_label_set_text(s_night_lbl, s_night ? "NIGHT ON" : "NIGHT OFF");
+    lv_obj_center(s_night_lbl);
+    lv_obj_add_event_cb(s_night_btn, night_evt, LV_EVENT_CLICKED, NULL);
+    theme_highlight();
+
     /* ---- right column: extra iobox controls ---- */
     const int rx = 430;
 
@@ -1279,14 +1699,14 @@ static void build_settings(void) {
     lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
     lv_obj_set_pos(lbl, rx, 210);
 
-    lv_obj_t *buzz_btn = lv_btn_create(s_scr_set);
-    lv_obj_add_style(buzz_btn, &btn_style, 0);
-    lv_obj_set_size(buzz_btn, 120, 40);
-    lv_obj_set_pos(buzz_btn, rx, 234);
-    s_buzz_lbl = lv_label_create(buzz_btn);
+    s_buzz_btn = lv_btn_create(s_scr_set);
+    lv_obj_add_style(s_buzz_btn, &btn_style, 0);
+    lv_obj_set_size(s_buzz_btn, 120, 40);
+    lv_obj_set_pos(s_buzz_btn, rx, 234);
+    s_buzz_lbl = lv_label_create(s_buzz_btn);
     lv_label_set_text(s_buzz_lbl, s_buzz_on ? "BUZZER ON" : "BUZZER OFF");
     lv_obj_center(s_buzz_lbl);
-    lv_obj_add_event_cb(buzz_btn, settings_buzz_evt, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_buzz_btn, settings_buzz_evt, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *beep_btn = lv_btn_create(s_scr_set);
     lv_obj_add_style(beep_btn, &btn_style, 0);
@@ -1303,14 +1723,14 @@ static void build_settings(void) {
     lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
     lv_obj_set_pos(lbl, rx, 290);
 
-    lv_obj_t *boot_btn = lv_btn_create(s_scr_set);
-    lv_obj_add_style(boot_btn, &btn_style, 0);
-    lv_obj_set_size(boot_btn, 130, 40);
-    lv_obj_set_pos(boot_btn, rx, 314);
-    s_boot_lbl = lv_label_create(boot_btn);
+    s_boot_btn = lv_btn_create(s_scr_set);
+    lv_obj_add_style(s_boot_btn, &btn_style, 0);
+    lv_obj_set_size(s_boot_btn, 130, 40);
+    lv_obj_set_pos(s_boot_btn, rx, 314);
+    s_boot_lbl = lv_label_create(s_boot_btn);
     lv_label_set_text(s_boot_lbl, s_boottest_on ? "BOOT TEST ON" : "BOOT TEST OFF");
     lv_obj_center(s_boot_lbl);
-    lv_obj_add_event_cb(boot_btn, settings_boot_evt, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_boot_btn, settings_boot_evt, LV_EVENT_CLICKED, NULL);
 
     /* Fuel gauge calibration + tuning (right column, below boot self-test) */
     lbl = lv_label_create(s_scr_set);
@@ -1401,31 +1821,6 @@ static void build_settings(void) {
     lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
     lv_obj_set_pos(lbl, rx, 462);
 
-    /* Clock backlight LED bar presets (left column, below fan temp) */
-    lbl = lv_label_create(s_scr_set);
-    lv_label_set_text(lbl, "CLOCK LIGHT");
-    lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
-    lv_obj_set_pos(lbl, 10, 370);
-
-    static const char *led_presets[] = { "amber", "red", "blue", "off" };
-    static const char *led_labels[]  = { "AMBER", "RED", "BLUE", "OFF" };
-    const int led_w[]   = { 75, 60, 65, 55 };
-    const int led_x[]   = { 10, 91, 157, 228 };
-    for (int i = 0; i < 4; i++) {
-        lv_obj_t *b = lv_btn_create(s_scr_set);
-        lv_obj_add_style(b, &btn_style, 0);
-        lv_obj_set_size(b, led_w[i], 40);
-        lv_obj_set_pos(b, led_x[i], 394);
-        l = lv_label_create(b);
-        lv_label_set_text(l, led_labels[i]);
-        lv_obj_center(l);
-        lv_obj_set_style_bg_color(b, lv_color_hex(
-            i == 0 ? 0x8B5A00 :
-            i == 1 ? 0x5A0000 :
-            i == 2 ? 0x001A5A : 0x2A2A3A), 0);
-        lv_obj_add_event_cb(b, settings_led_evt, LV_EVENT_CLICKED, (void *)led_presets[i]);
-    }
-
     /* Back button */
     lv_obj_t *btn_back = lv_btn_create(s_scr_set);
     lv_obj_add_style(btn_back, &btn_style, 0);
@@ -1442,6 +1837,61 @@ static void build_settings(void) {
 void ui_show_settings(void) {
     if (!s_scr_set) build_settings();
     lv_scr_load(s_scr_set);
+    /* Apply current mode highlights on page show */
+    update_fan_mode_buttons(s_prev.fanMode);
+    update_iac_mode_buttons(s_prev.iacMode);
+    update_buzzer_button(s_prev.buzzerOn);
+    update_boot_button(s_prev.bootTestOn);
+    theme_highlight();
+}
+
+/* Settings button highlighting helpers — guard against NULL (page not built yet) */
+static void update_fan_mode_buttons(uint8_t mode) {
+    /* mode: 0=off, 1=auto, 2=manual_on — map to correct button index */
+    lv_obj_t *main_btns[3] = { s_main_foff, s_main_fauto, s_main_fon };
+    lv_obj_t *set_btns[3]  = { s_btn_foff,  s_btn_fauto,  s_btn_fon };
+    for (int i = 0; i < 3; i++) {
+        bool active = (mode == i);
+        if (main_btns[i]) {
+            lv_obj_set_style_bg_opa(main_btns[i], active ? LV_OPA_100 : LV_OPA_50, 0);
+            lv_obj_set_style_bg_color(main_btns[i], active ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+        }
+        if (set_btns[i]) {
+            lv_obj_set_style_bg_opa(set_btns[i], active ? LV_OPA_100 : LV_OPA_50, 0);
+            lv_obj_set_style_bg_color(set_btns[i], active ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+        }
+    }
+}
+
+static void update_iac_mode_buttons(uint8_t mode) {
+    /* mode: 0=man, 1=auto, 2=follow */
+    lv_obj_t *main_btns[3] = { s_main_iman, s_main_iauto, s_main_ifollow };
+    lv_obj_t *set_btns[3]  = { s_btn_iman,  s_btn_iauto,  s_btn_ifollow };
+    for (int i = 0; i < 3; i++) {
+        bool active = (mode == i);
+        if (main_btns[i]) {
+            lv_obj_set_style_bg_opa(main_btns[i], active ? LV_OPA_100 : LV_OPA_50, 0);
+            lv_obj_set_style_bg_color(main_btns[i], active ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+        }
+        if (set_btns[i]) {
+            lv_obj_set_style_bg_opa(set_btns[i], active ? LV_OPA_100 : LV_OPA_50, 0);
+            lv_obj_set_style_bg_color(set_btns[i], active ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+        }
+    }
+}
+
+static void update_buzzer_button(bool on) {
+    if (!s_buzz_btn || !s_buzz_lbl) return;
+    lv_obj_set_style_bg_opa(s_buzz_btn, on ? LV_OPA_100 : LV_OPA_50, 0);
+    lv_obj_set_style_bg_color(s_buzz_btn, on ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+    lv_label_set_text(s_buzz_lbl, on ? "BUZZER ON" : "BUZZER OFF");
+}
+
+static void update_boot_button(bool on) {
+    if (!s_boot_btn || !s_boot_lbl) return;
+    lv_obj_set_style_bg_opa(s_boot_btn, on ? LV_OPA_100 : LV_OPA_50, 0);
+    lv_obj_set_style_bg_color(s_boot_btn, on ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+    lv_label_set_text(s_boot_lbl, on ? "BOOT TEST ON" : "BOOT TEST OFF");
 }
 
 void ui_update(const dash_data_t *d) {
@@ -1451,6 +1901,13 @@ void ui_update(const dash_data_t *d) {
     lv_obj_set_style_text_color(s_can_lbl, lv_color_hex(ok ? COL_GOOD : COL_BAD), 0);
     if (ok != s_prev.canOk)
         lv_label_set_text(s_can_lbl, ok ? "CAN OK" : "CAN LOST");
+
+    /* BOX chip: ESP-NOW link to iobox3 alive (redraw only on transition) */
+    if (d->ioboxOk != s_prev.ioboxOk) {
+        bool bo = d->ioboxOk;
+        lv_label_set_text(s_iobox_lbl, bo ? "BOX OK" : "BOX LOST");
+        lv_obj_set_style_bg_color(s_iobox_lbl, lv_color_hex(bo ? COL_GOOD : COL_BAD), 0);
+    }
 
     /* RPM: slide star cursor over the load-up ring */
     int32_t rpm = ok ? d->rpm : 0;
@@ -1473,7 +1930,7 @@ void ui_update(const dash_data_t *d) {
         int32_t start_cfg = s_shift_rpm_cfg - SHIFT_START_GAP;
         if (start_cfg < RPM_MIN) start_cfg = RPM_MIN;
 
-        uint32_t nc = COL_GOOD;
+        uint32_t nc = accent_live();
         if (rpm >= s_shift_rpm_cfg)  nc = COL_BAD;
         else if (rpm >= start_cfg)   nc = COL_WARN;
         if (nc != s_glow_col_prev) {
@@ -1489,7 +1946,7 @@ void ui_update(const dash_data_t *d) {
             s_ring_cfg = s_shift_rpm_cfg;
             s_prev_sg = s_prev_sa = s_prev_sr = -1;
         }
-        if (nowms - s_ring_last_ms >= 100) {
+        if (nowms - s_ring_last_ms >= 50) {
             s_ring_last_ms = nowms;
             float a_now  = gauge_angle(gauge_pct_rpm(rpm));
             float a_warn = gauge_angle(100.0f * (start_cfg - RPM_MIN) / (RPM_MAX - RPM_MIN));
@@ -1608,6 +2065,16 @@ void ui_update(const dash_data_t *d) {
 
     /* warning banner */
     warn_banner_update(d);
+
+    /* Settings button highlighting - update on mode transition */
+    if (d->fanMode != s_prev.fanMode)
+        update_fan_mode_buttons(d->fanMode);
+    if (d->iacMode != s_prev.iacMode)
+        update_iac_mode_buttons(d->iacMode);
+    if (d->buzzerOn != s_prev.buzzerOn)
+        update_buzzer_button(d->buzzerOn);
+    if (d->bootTestOn != s_prev.bootTestOn)
+        update_boot_button(d->bootTestOn);
 
     s_prev = *d;
 }

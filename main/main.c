@@ -58,9 +58,23 @@ static void can_update_task(void *arg)
         can_rx_get_data_copy(&snap);
         if (esp_lv_adapter_lock(-1) == ESP_OK) {
             ui_update(&snap);
+            ui_theme_apply_once();
             esp_lv_adapter_unlock();
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+}
+
+/* Persist the dash's own settings (e.g. gauge face) to NVS. Runs on a real
+ * stack so the flash commit's cache-freeze path doesn't overflow the LVGL
+ * task (esp_cache_freeze assert seen when writing from the LVGL event
+ * handler). Must not touch LVGL or hold the adapter lock. */
+static void ui_persist_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        ui_face_persist_once();
     }
 }
 
@@ -125,6 +139,9 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Starting CAN UI update task (20Hz)");
     xTaskCreate(can_update_task, "can_update", 4096, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "Starting UI persistence task");
+    xTaskCreate(ui_persist_task, "ui_persist", 4096, NULL, 3, NULL);
 
     /* console DISABLED: usb_serial_jtag_driver_install reconfigures the
      * GPIO19/20 pads (S3 USB D-/D+) and severs the TWAI RX input — CAN

@@ -37,6 +37,13 @@ esp_err_t can_tx_fan_temp(int16_t on_temp_f_x10) {
     return can_tx_send_cmd('F', val);
 }
 
+esp_err_t can_tx_fan_off_temp(int16_t off_temp_f_x10) {
+    char val[8];
+    /* iobox 'E' handler takes PLAIN deg-F (90-270F) and multiplies by 10. */
+    snprintf(val, sizeof(val), "%d", off_temp_f_x10 / 10);
+    return can_tx_send_cmd('E', val);
+}
+
 esp_err_t can_tx_iac_auto(bool auto_mode) {
     return can_tx_send_cmd('I', auto_mode ? "A" : "0");
 }

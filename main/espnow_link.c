@@ -20,7 +20,7 @@ static const char *TAG = "ESPNOW";
 #define LINK_TX_CORE       0
 
 #define FRAME_ECU          0xA0   /* dash -> iobox3: [A0][maskLo][maskHi][72B outpc] */
-#define FRAME_STATUS       0xB0   /* iobox3 -> dash: [B0][anLatch][0][seq][warn][0][0][0] */
+#define FRAME_STATUS       0xB0   /* iobox3 -> dash: [B0][anLatch][0][seq][warn][gas%][a1..a4 mV][iac%][fanMode][iacMode][buzzerOn][bootTestOn] */
 #define FRAME_CMD          0xC0   /* dash -> iobox3: [C0][len][cmd...] */
 
 static const uint8_t s_broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -36,6 +36,12 @@ static void link_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, i
         if (len >= 14) {
             can_rx_set_gas(data[5]);                              /* v3: gas% */
             can_rx_set_a4mv(data[12] | (data[13] << 8));          /* v2: A4 source-mV */
+        }
+        if (len >= 19) {                                          /* v4: mode state */
+            can_rx_set_fan_mode(data[15]);
+            can_rx_set_iac_mode(data[16]);
+            can_rx_set_buzzer_on(data[17]);
+            can_rx_set_boot_test(data[18]);
         }
     }
 }
