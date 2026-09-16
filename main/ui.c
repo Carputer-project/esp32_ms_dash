@@ -45,15 +45,31 @@ static lv_obj_t *s_scr_set;
 static lv_obj_t *s_mark_glow;
 static lv_obj_t *s_mark;
 
-/* gauge face: two fully-painted static dials (OEM + classic), each on its own
- * carrier object. The moving parts (ring, star, labels, bars) are siblings that
- * sit above both, so only the visible dial swaps. Tap the dial to toggle. */
+/* gauge face: three fully-painted static dials (classic / OEM / needle), each
+ * on its own carrier object. The moving parts (ring, star/needle, labels, bars)
+ * are siblings that sit above all of them, so only the visible dial swaps. Tap
+ * the dial to cycle through the ENABLED faces ("which" from settings). Each
+ * face has a colour state: AUTO follows the global accent, or a fixed theme
+ * colour — "colour" from settings.
+ *  - FACE_CLASSIC: neon look, star cursor + load-up ring
+ *  - FACE_OEM:     neutral factory look, star cursor + load-up ring
+ *  - FACE_NEEDLE:  classic analog tach with a real needle (no star/ring) */
 #define FACE_CLASSIC 0
 #define FACE_OEM     1
-static lv_obj_t *s_face_oem, *s_face_classic;
-static lv_obj_t *s_face_oem_canvas, *s_face_classic_canvas;
+#define FACE_NEEDLE  2
+#define FACE_COUNT   3
+static lv_obj_t *s_face_oem, *s_face_classic, *s_face_needle;
+static lv_obj_t *s_face_oem_canvas, *s_face_classic_canvas, *s_face_needle_canvas;
 static int s_face_active = FACE_CLASSIC;
 static bool s_face_dirty = false;   /* face changed; ui_face_persist_once() writes to NVS */
+/* Per-face colour state: -1 = OFF (excluded from tap cycle, kept dormant),
+ * 0 = AUTO (follow global accent), 1..THEME_COUNT = fixed theme colour. */
+static int8_t s_face_state[FACE_COUNT] = { 0, 0, 0 };
+static const char *s_face_names[FACE_COUNT] = { "CLS", "OEM", "NDL" };
+
+/* needle-pointer geometry (FACE_NEEDLE only): a line from ~0.1R behind the hub
+ * out to ~0.62R, recoloured by the face colour. A hub dot covers the base. */
+static lv_obj_t *s_needle, *s_needle_hub;
 
 /* star cursor (3-point, pre-rendered canvas) + zone-tinted glow halo */
 #define STARSZ 30
@@ -142,6 +158,8 @@ bool     s_theme_apply_pending = false; /* theme changed; ui_theme_apply_once() 
 static lv_obj_t *s_btn_theme[THEME_COUNT];
 static lv_obj_t *s_night_btn;
 static lv_obj_t *s_night_lbl;
+static lv_obj_t *s_btn_face[FACE_COUNT];
+static lv_obj_t *s_face_lbl[FACE_COUNT];
 
 /* Dash-side engine-warning thresholds. The dash hears the raw outpc over CAN
  * directly, so it evaluates the threshold warnings itself (works even if the
@@ -287,6 +305,7 @@ static void settings_beep_evt(lv_event_t *e);
 static void settings_boot_evt(lv_event_t *e);
 
 static void face_toggle_evt(lv_event_t *e);
+static void ui_face_apply_live(void);
 
 #define DEG2RAD(d) ((d) * 3.14159265f / 180.0f)
 
@@ -342,6 +361,15 @@ static uint32_t accent_live(void) {
     return (s_accent >> 1) & 0x7F7F7F;
 }
 
+/* Effective colour for a face: fixed theme colour if the face has one pinned
+ * (s_face_state >= 1), else the global accent (night-dimming applied). */
+static uint32_t face_colour(int f) {
+    if (f >= 0 && f < FACE_COUNT && s_face_state[f] >= 1 &&
+        s_face_state[f] <= THEME_COUNT)
+        return s_theme_colors[s_face_state[f] - 1];
+    return accent_live();
+}
+
 static void gauge_paint_classic(lv_obj_t *parent) {
     int cx = GAUGE_CX, cy = GAUGE_CY, r = GAUGE_R;
     int sz = r * 2 + 20;
@@ -382,7 +410,7 @@ static void gauge_paint_classic(lv_obj_t *parent) {
     }
 
     /* theme-colored bezel ring */
-    face_arc(&layer, ox, oy, r, 0, 360, accent_live(), 2, LV_OPA_50);
+    face_arc(&layer, ox, oy, r, 0, 360, face_colour(FACE_CLASSIC), 2, LV_OPA_50);
 
     /* minor ticks (every 6 degrees) */
     for (int a = (int)GAUGE_A0; a <= (int)GAUGE_A1; a += 6)
@@ -390,7 +418,7 @@ static void gauge_paint_classic(lv_obj_t *parent) {
 
     /* major ticks (every 25%) */
     for (int p = 0; p <= 100; p += 25)
-        face_line(&layer, ox, oy, gauge_angle((float)p), (int)(r * 0.70f), (int)(r * 0.92f), accent_live(), 2);
+        face_line(&layer, ox, oy, gauge_angle((float)p), (int)(r * 0.70f), (int)(r * 0.92f), face_colour(FACE_CLASSIC), 2);
 
     /* scale numbers */
     static const char *scale_txt[] = {"0", "1k", "2k", "3k", "4k", "5k", "6k", "7k", "8k"};
@@ -456,10 +484,10 @@ static void gauge_paint_oem(lv_obj_t *parent) {
     for (int a = (int)GAUGE_A0; a <= (int)GAUGE_A1; a += 5)
         face_line(&layer, ox, oy, (float)a, (int)(r * 0.80f), (int)(r * 0.88f), 0xD8D8E0, 1);
     for (int p = 0; p <= 100; p += 25)
-        face_line(&layer, ox, oy, gauge_angle((float)p), (int)(r * 0.80f), (int)(r * 0.92f), accent_live(), 2);
+        face_line(&layer, ox, oy, gauge_angle((float)p), (int)(r * 0.80f), (int)(r * 0.92f), face_colour(FACE_OEM), 2);
 
     /* hairline bezel */
-    face_arc(&layer, ox, oy, r, 0, 360, accent_live(), 1, LV_OPA_90);
+    face_arc(&layer, ox, oy, r, 0, 360, face_colour(FACE_OEM), 1, LV_OPA_90);
 
     /* scale numbers, OEM-neutral */
     static const char *scale_txt[] = {"0", "1k", "2k", "3k", "4k", "5k", "6k", "7k", "8k"};
@@ -482,19 +510,125 @@ static void gauge_paint_oem(lv_obj_t *parent) {
     lv_canvas_finish_layer(canvas, &layer);
 }
 
-/* Re-paint the active gauge face after an accent/night change. The accent is baked
- * into each static dial canvas. We only repaint the VISIBLE face immediately; the
- * hidden face is marked dirty and repainted on next face toggle (so it's ready
- * when shown). This keeps the per-frame LVGL work under the watchdog budget. */
+/* Needle gauge (FACE_NEEDLE): classic analog tach — white tick marks, clean
+ * sweep, thin redline band, accent-coloured bezel + major ticks. The pointer is
+ * a real needle (s_needle) instead of the star cursor; it sweeps 135..405 deg.
+ * Redline/warn arcs derive from the live NVS shift setting like the other faces. */
+static void gauge_paint_needle(lv_obj_t *parent) {
+    int cx = GAUGE_CX, cy = GAUGE_CY, r = GAUGE_R;
+    int sz = r * 2 + 20;
+
+    size_t fbytes = (size_t)sz * sz * 2 + 64;
+    void *fbuf = heap_caps_malloc(fbytes, MALLOC_CAP_SPIRAM);
+    if (!fbuf) fbuf = malloc(fbytes);
+    lv_obj_t *canvas = lv_canvas_create(parent);
+    lv_obj_remove_style_all(canvas);
+    lv_canvas_set_buffer(canvas, fbuf, sz, sz, LV_COLOR_FORMAT_RGB565);
+    lv_canvas_fill_bg(canvas, lv_color_hex(COL_BG), LV_OPA_COVER);
+    lv_obj_set_pos(canvas, cx - sz / 2, cy - sz / 2);
+    s_face_needle_canvas = canvas;
+
+    lv_layer_t layer;
+    lv_canvas_init_layer(canvas, &layer);
+
+    int ox = sz / 2, oy = sz / 2;
+
+    /* arc rail the needle rides on (accent) */
+    face_arc(&layer, ox, oy, (int)(r * 0.60f), GAUGE_A0, GAUGE_A1, face_colour(FACE_NEEDLE), 2, LV_OPA_80);
+
+    /* thin redline band at the tail of the sweep */
+    if (RPM_REDLINE > RPM_MIN) {
+        float rpct = gauge_pct_rpm(RPM_REDLINE);
+        face_arc(&layer, ox, oy, (int)(r * 0.60f), gauge_angle(rpct), GAUGE_A1,
+                 COL_BAD, (int)(r * 0.10f), LV_OPA_60);
+    }
+
+    /* amber warn zone just below redline */
+    if (RPM_REDLINE > RPM_MIN) {
+        float rpct = gauge_pct_rpm(RPM_REDLINE);
+        float w0 = gauge_pct_rpm(RPM_REDLINE - 1000);
+        if (w0 < 0) w0 = 0;
+        face_arc(&layer, ox, oy, (int)(r * 0.60f), gauge_angle(w0), gauge_angle(rpct),
+                 COL_WARN, (int)(r * 0.12f), LV_OPA_40);
+    }
+
+    /* accent-coloured bezel ring */
+    face_arc(&layer, ox, oy, r, 0, 360, face_colour(FACE_NEEDLE), 2, LV_OPA_80);
+
+    /* minor ticks (every 5 degrees) */
+    for (int a = (int)GAUGE_A0; a <= (int)GAUGE_A1; a += 5)
+        face_line(&layer, ox, oy, (float)a, (int)(r * 0.66f), (int)(r * 0.76f), 0xD8D8E0, 1);
+
+    /* major ticks (every 25%) */
+    for (int p = 0; p <= 100; p += 25)
+        face_line(&layer, ox, oy, gauge_angle((float)p), (int)(r * 0.63f), (int)(r * 0.80f), face_colour(FACE_NEEDLE), 2);
+
+    /* scale numbers */
+    static const char *scale_txt[] = {"0", "1k", "2k", "3k", "4k", "5k", "6k", "7k", "8k"};
+    static const int scale_pct[] = {0, 11, 22, 33, 44, 56, 67, 78, 89};
+    int lr = (int)(r * 0.46f);
+    for (int i = 0; i < 9; i++) {
+        float a = gauge_angle((float)scale_pct[i]);
+        float rad = DEG2RAD(a);
+        int lx = (int)(ox + lr * cosf(rad));
+        int ly = (int)(oy + lr * sinf(rad));
+        lv_obj_t *l = lv_label_create(parent);
+        lv_label_set_text(l, scale_txt[i]);
+        lv_obj_set_style_text_color(l, lv_color_hex(COL_DIM), 0);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+        lv_obj_set_width(l, 28);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(l, (cx - sz / 2) + lx - 14, (cy - sz / 2) + ly - 8);
+    }
+
+    lv_canvas_finish_layer(canvas, &layer);
+}
+
+/* Re-paint a face canvas. LVGL's canvas destructor only drops the image cache
+ * (it never frees the caller's buffer), so we free the old SPIRAM buffer here.
+ * s_face_baked[] records the colour each canvas was last painted with so the
+ * face toggle only repaints a canvas when its colour is actually stale. */
+static uint32_t s_face_baked[FACE_COUNT] = { 0 };
+
+static void face_canvas_del(lv_obj_t **slot) {
+    if (!*slot) return;
+    lv_draw_buf_t *db = lv_canvas_get_draw_buf(*slot);
+    void *old = db ? db->data : NULL;
+    lv_obj_del(*slot);
+    *slot = NULL;
+    if (old) free(old);
+}
+
+static void face_paint(int f, bool force) {
+    lv_obj_t **slot = NULL, **carrier = NULL;
+    if (f == FACE_CLASSIC)  { slot = &s_face_classic_canvas; carrier = &s_face_classic; }
+    else if (f == FACE_OEM) { slot = &s_face_oem_canvas;     carrier = &s_face_oem; }
+    else                    { slot = &s_face_needle_canvas;  carrier = &s_face_needle; }
+    if (!*carrier) return;
+    uint32_t want = face_colour(f);
+    if (!force && s_face_baked[f] == want) return;   /* already correct */
+    face_canvas_del(slot);
+    if (f == FACE_CLASSIC) gauge_paint_classic(*carrier);
+    else if (f == FACE_OEM) gauge_paint_oem(*carrier);
+    else gauge_paint_needle(*carrier);
+    s_face_baked[f] = want;
+    s_face_dirty = true;
+}
+
+/* Re-paint the active gauge face after an accent/fixed-colour/night change.
+ * We only repaint the VISIBLE face immediately; hidden faces are marked stale
+ * and repainted on next face toggle (so they're ready when shown). This keeps
+ * the per-frame LVGL work under the watchdog budget. The needle's colour is an
+ * object style, so we just restyle it (baked canvas colour is already tracked). */
 static void ui_theme_apply(void) {
-    if (s_face_active == FACE_OEM) {
-        if (s_face_oem_canvas) { lv_obj_del(s_face_oem_canvas); s_face_oem_canvas = NULL; }
-        gauge_paint_oem(s_face_oem);
-        s_face_dirty = true;
+    face_paint(s_face_active, true);
+    if (s_face_active == FACE_NEEDLE) {
+        if (s_needle) lv_obj_set_style_line_color(s_needle, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+        if (s_needle_hub) lv_obj_set_style_bg_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+        if (s_needle_hub) lv_obj_set_style_border_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+        for (int i = 0; i < FACE_COUNT; i++) if (i != FACE_NEEDLE) s_face_baked[i] = 0xFFFFFFFF;
     } else {
-        if (s_face_classic_canvas) { lv_obj_del(s_face_classic_canvas); s_face_classic_canvas = NULL; }
-        gauge_paint_classic(s_face_classic);
-        s_face_dirty = true;
+        for (int i = 0; i < FACE_COUNT; i++) if (i != s_face_active) s_face_baked[i] = 0xFFFFFFFF;
     }
 }
 
@@ -713,25 +847,42 @@ static void ui_init_main_build(void) {
     lv_obj_set_style_bg_color(s_scr_main, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_bg_opa(s_scr_main, LV_OPA_COVER, 0);
 
-    /* two gauge faces: each a fully-painted static dial on its own carrier.
-     * The moving parts below (ring, star, labels, bars) are siblings layered
-     * above both, so tap-to-toggle only swaps the dial background. */
+    /* three gauge faces: each a fully-painted static dial on its own carrier.
+     * The moving parts below (ring, star/needle, labels, bars) are siblings
+     * layered above all of them, so tap-to-toggle only swaps the dial. */
     s_face_oem = lv_obj_create(s_scr_main);
     lv_obj_remove_style_all(s_face_oem);
     lv_obj_set_size(s_face_oem, 800, 480);
     lv_obj_set_pos(s_face_oem, 0, 0);
     gauge_paint_oem(s_face_oem);
+    s_face_baked[FACE_OEM] = face_colour(FACE_OEM);
 
     s_face_classic = lv_obj_create(s_scr_main);
     lv_obj_remove_style_all(s_face_classic);
     lv_obj_set_size(s_face_classic, 800, 480);
     lv_obj_set_pos(s_face_classic, 0, 0);
     gauge_paint_classic(s_face_classic);
+    s_face_baked[FACE_CLASSIC] = face_colour(FACE_CLASSIC);
 
+    s_face_needle = lv_obj_create(s_scr_main);
+    lv_obj_remove_style_all(s_face_needle);
+    lv_obj_set_size(s_face_needle, 800, 480);
+    lv_obj_set_pos(s_face_needle, 0, 0);
+    gauge_paint_needle(s_face_needle);
+    s_face_baked[FACE_NEEDLE] = face_colour(FACE_NEEDLE);
+
+    /* FM face active: show the needle, hide star cursor + load-up ring. The
+     * dial swap + moving-part visibility are driven by ui_face_apply_live(). */
+    lv_obj_add_flag(s_face_oem, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_face_classic, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_face_needle, LV_OBJ_FLAG_HIDDEN);
     if (s_face_active == FACE_OEM)
-        lv_obj_add_flag(s_face_classic, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_face_oem, LV_OBJ_FLAG_HIDDEN);
+    else if (s_face_active == FACE_NEEDLE)
+        lv_obj_clear_flag(s_face_needle, LV_OBJ_FLAG_HIDDEN);
     else
-        lv_obj_add_flag(s_face_oem, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_face_classic, LV_OBJ_FLAG_HIDDEN);
+    ui_face_apply_live();
 
     /* load-up ring: 3 stacked zone arcs (green/amber/red), end angle advances
      * with rpm like a shift indicator filling up. Zero-span until first update. */
@@ -819,6 +970,30 @@ static void ui_init_main_build(void) {
     lv_coord_t dy0 = (lv_coord_t)(GAUGE_CY + GAUGE_R * 0.85f * sinf(rad0));
     lv_obj_set_pos(s_mark_glow, dx0 - msize / 2, dy0 - msize / 2);
     lv_obj_set_pos(s_mark, dx0 - s_mark_sz / 2, dy0 - s_mark_sz / 2);
+
+    /* FACE_NEEDLE pointer: a line sweeping from behind the hub out to the rail,
+     * plus a small hub dot. Recoloured by ui_theme_apply / face tap. */
+    s_needle = lv_line_create(s_scr_main);
+    lv_obj_remove_style_all(s_needle);
+    lv_line_set_points(s_needle, (const lv_point_precise_t[]){ { GAUGE_CX, GAUGE_CY },
+                                                               { GAUGE_CX, GAUGE_CY } }, 2);
+    lv_obj_set_style_line_width(s_needle, 5, 0);
+    lv_obj_set_style_line_color(s_needle, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+    lv_obj_set_style_line_rounded(s_needle, true, 0);
+    lv_obj_set_style_line_opa(s_needle, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_needle, LV_OBJ_FLAG_HIDDEN);   /* ui_face_apply_live() reveals */
+
+    int hsz = 16;
+    s_needle_hub = lv_obj_create(s_scr_main);
+    lv_obj_remove_style_all(s_needle_hub);
+    lv_obj_set_size(s_needle_hub, hsz, hsz);
+    lv_obj_set_pos(s_needle_hub, GAUGE_CX - hsz / 2, GAUGE_CY - hsz / 2);
+    lv_obj_set_style_bg_color(s_needle_hub, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(s_needle_hub, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_needle_hub, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(s_needle_hub, 3, 0);
+    lv_obj_set_style_border_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+    lv_obj_add_flag(s_needle_hub, LV_OBJ_FLAG_HIDDEN);
 
     /* "RPM" title label */
     lv_obj_t *title = lv_label_create(s_scr_main);
@@ -1045,20 +1220,69 @@ static void ui_init_main_build(void) {
     lv_obj_add_flag(face_zone, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(face_zone, face_toggle_evt, LV_EVENT_CLICKED, NULL);
 
+    /* moving parts (ring/star/needle) now exist — apply live visibility final */
+    ui_face_apply_live();
+
     ESP_LOGI(TAG, "Main UI built (not shown)");
     memset(&s_prev, 0, sizeof(s_prev));
 }
 
+/* Show/hide the moving parts matching s_face_active:
+ *  - CLASSIC / OEM use the star cursor + load-up ring (+ glow halo)
+ *  - NEEDLE uses the needle line + hub (no star/ring) */
+static void ui_face_apply_live(void) {
+    bool needleFace = (s_face_active == FACE_NEEDLE);
+    if (s_needle) {
+        if (needleFace) lv_obj_clear_flag(s_needle, LV_OBJ_FLAG_HIDDEN);
+        else            lv_obj_add_flag(s_needle, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_needle_hub) {
+        if (needleFace) lv_obj_clear_flag(s_needle_hub, LV_OBJ_FLAG_HIDDEN);
+        else            lv_obj_add_flag(s_needle_hub, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_mark) {
+        if (needleFace) lv_obj_add_flag(s_mark, LV_OBJ_FLAG_HIDDEN);
+        else            lv_obj_clear_flag(s_mark, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_mark_glow) {
+        if (needleFace) lv_obj_add_flag(s_mark_glow, LV_OBJ_FLAG_HIDDEN);
+        else            lv_obj_clear_flag(s_mark_glow, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_t *rings[3] = { s_ring_g, s_ring_a, s_ring_r };
+    for (int i = 0; i < 3; i++) {
+        if (!rings[i]) continue;
+        if (needleFace) lv_obj_add_flag(rings[i], LV_OBJ_FLAG_HIDDEN);
+        else            lv_obj_clear_flag(rings[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Tap the dial: advance to the NEXT face whose s_face_state != -1 (wrap).
+ * If only the current face is enabled (or none), it stays put. */
 static void face_toggle_evt(lv_event_t *e) {
     (void)e;
-    if (s_face_active == FACE_OEM) {
-        s_face_active = FACE_CLASSIC;
-        lv_obj_clear_flag(s_face_classic, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_face_oem, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        s_face_active = FACE_OEM;
-        lv_obj_clear_flag(s_face_oem, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_face_classic, LV_OBJ_FLAG_HIDDEN);
+    if (s_face_active >= 0 && s_face_active < FACE_COUNT) {
+        int nxt = s_face_active;
+        for (int i = 1; i <= FACE_COUNT; i++) {
+            int f = (s_face_active + i) % FACE_COUNT;
+            if (s_face_state[f] != -1) { nxt = f; break; }
+        }
+        if (nxt != s_face_active) {
+            s_face_active = nxt;
+            lv_obj_t *faces[FACE_COUNT] = { s_face_classic, s_face_oem, s_face_needle };
+            for (int i = 0; i < FACE_COUNT; i++)
+                if (faces[i]) lv_obj_add_flag(faces[i], LV_OBJ_FLAG_HIDDEN);
+            if (faces[s_face_active])
+                lv_obj_clear_flag(faces[s_face_active], LV_OBJ_FLAG_HIDDEN);
+            /* Repaint the now-shown face if its colour is stale (fixed colour
+             * changed while hidden), plus restyle the needle for the new face. */
+            face_paint(s_face_active, false);
+            if (s_face_active == FACE_NEEDLE && s_needle) {
+                lv_obj_set_style_line_color(s_needle, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+                lv_obj_set_style_bg_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+                lv_obj_set_style_border_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+            }
+            ui_face_apply_live();
+        }
     }
     /* Do NOT flash-write from this LVGL event handler — the NVS commit's
      * cache-freeze path overflows the LVGL task stack (assert). Just flag it;
@@ -1075,6 +1299,11 @@ void ui_face_persist_once(void)
     if (nvs_open("dashui", NVS_READWRITE, &h) == ESP_OK) {
         if (s_face_dirty) {
             nvs_set_i32(h, "face", s_face_active);
+            for (int i = 0; i < FACE_COUNT; i++) {
+                char key[8];
+                snprintf(key, sizeof(key), "fst%d", i);
+                nvs_set_i32(h, key, (int32_t)s_face_state[i]);
+            }
             s_face_dirty = false;
         }
         if (s_theme_dirty) {
@@ -1177,8 +1406,20 @@ static void settings_nvs_load(void) {
             s_warn_afr_low = v;
         if (nvs_get_i32(h, "w_afrhi", &v) == ESP_OK && v >= 120 && v <= 220)
             s_warn_afr_high = v;
-        if (nvs_get_i32(h, "face", &v) == ESP_OK && (v == FACE_CLASSIC || v == FACE_OEM))
+        if (nvs_get_i32(h, "face", &v) == ESP_OK && v >= 0 && v < FACE_COUNT)
             s_face_active = v;
+        for (int i = 0; i < FACE_COUNT; i++) {
+            char key[8];
+            snprintf(key, sizeof(key), "fst%d", i);
+            if (nvs_get_i32(h, key, &v) == ESP_OK && v >= -1 && v <= THEME_COUNT)
+                s_face_state[i] = (int8_t)v;
+        }
+        /* Never boot onto an OFF face — move to the first enabled one. */
+        if (s_face_state[s_face_active] == -1) {
+            for (int i = 0; i < FACE_COUNT; i++)
+                if (s_face_state[i] != -1) { s_face_active = i; break; }
+            s_face_dirty = true;
+        }
         if (nvs_get_i32(h, "accent", &v) == ESP_OK)
             for (int i = 0; i < THEME_COUNT; i++)
                 if ((uint32_t)v == s_theme_colors[i]) { s_accent = (uint32_t)v; break; }
@@ -1223,6 +1464,7 @@ static void scr_set_delete_evt(lv_event_t *e) {
     s_gas_lbl = NULL;
     s_tgt_val_lbl = NULL;
     for (int i = 0; i < THEME_COUNT; i++) s_btn_theme[i] = NULL;
+    for (int i = 0; i < FACE_COUNT; i++) { s_btn_face[i] = NULL; s_face_lbl[i] = NULL; }
     s_night_btn = NULL; s_night_lbl = NULL;
 }
 
@@ -1272,6 +1514,63 @@ static void theme_highlight(void) {
         lv_obj_set_style_bg_color(s_night_btn,
             lv_color_hex(s_night ? COL_GOOD : 0x2A2A3A), 0);
         lv_label_set_text(s_night_lbl, s_night ? "NIGHT ON" : "NIGHT OFF");
+    }
+}
+
+static const char *kThemeNames[THEME_COUNT] = { "GRN", "BLU", "PUR", "AMB" };
+
+static void face_highlight(void);
+
+/* Per-face state button: cycles OFF -> AUTO -> GRN/BLU/PUR/AMB -> OFF.
+ * Taps only change the NEXT face (so the active face never disappears); if the
+ * face being toggled IS the active one, only its colour changes, never to OFF. */
+static void face_cycle_evt(lv_event_t *e) {
+    int f = (int)(intptr_t)lv_event_get_user_data(e);
+    if (f < 0 || f >= FACE_COUNT) return;
+    int8_t st = s_face_state[f];
+    if (f == s_face_active) {
+        /* active face: never go OFF, just advance colour (AUTO -> 1 -> ... -> n -> AUTO) */
+        st++;
+        if (st > THEME_COUNT) st = 0;
+    } else {
+        /* inactive face: OFF -> AUTO -> colours -> OFF */
+        st++;
+        if (st > THEME_COUNT) st = -1;
+    }
+    s_face_state[f] = st;
+    s_face_dirty = true;
+    if (f == s_face_active) {
+        face_paint(f, true);   /* active: re-bake now (also frees old buffer) */
+        if (f == FACE_NEEDLE && s_needle) {
+            lv_obj_set_style_line_color(s_needle, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+            lv_obj_set_style_bg_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+            lv_obj_set_style_border_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
+        }
+    } else {
+        s_face_baked[f] = 0xFFFFFFFF;   /* stale: repainted on next toggle to it */
+    }
+    face_highlight();
+}
+
+/* Reflect s_face_state[] onto the 3 face buttons. */
+static void face_highlight(void) {
+    for (int i = 0; i < FACE_COUNT; i++) {
+        lv_obj_t *b = s_btn_face[i];
+        if (!b) continue;
+        int8_t st = s_face_state[i];
+        uint32_t col;
+        const char *txt;
+        if (st <= 0) {
+            col = 0x2A2A3A;
+            txt = (st == 0) ? "AUTO" : "OFF";
+        } else {
+            col = s_theme_colors[st - 1];
+            txt = kThemeNames[st - 1];
+        }
+        lv_obj_set_style_bg_color(b, lv_color_hex(col), 0);
+        lv_label_set_text(s_face_lbl[i], txt);
+        lv_obj_set_style_border_width(b, i == s_face_active ? 2 : 0, 0);
+        lv_obj_set_style_border_color(b, lv_color_hex(COL_TEXT), 0);
     }
 }
 
@@ -1515,6 +1814,26 @@ static void build_settings(void) {
     lv_obj_set_style_text_color(s_tgt_val_lbl, lv_color_hex(COL_TEXT), 0);
     lv_obj_set_pos(s_tgt_val_lbl, 135, y + 34);
 
+    /* Gauge-face config: one button per face. Each cycles its own state:
+     * OFF / AUTO (follow accent) / fixed accent colour. The ACTIVE face can
+     * never be turned OFF from here (tap the dial to cycle faces). */
+    lbl = lv_label_create(s_scr_set);
+    lv_label_set_text(lbl, "GAUGE FACE (tap dial to switch)");
+    lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
+    lv_obj_set_pos(lbl, 10, 290);
+    for (int i = 0; i < FACE_COUNT; i++) {
+        s_btn_face[i] = lv_btn_create(s_scr_set);
+        lv_obj_add_style(s_btn_face[i], &btn_style, 0);
+        lv_obj_set_size(s_btn_face[i], 64, 36);
+        lv_obj_set_pos(s_btn_face[i], 10 + i * 70, 314);
+        lv_obj_add_event_cb(s_btn_face[i], face_cycle_evt, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+        s_face_lbl[i] = lv_label_create(s_btn_face[i]);
+        lv_label_set_text(s_face_lbl[i], s_face_names[i]);
+        lv_obj_center(s_face_lbl[i]);
+    }
+    face_highlight();
+
     /* Accent theme picker + night toggle (left column bottom, below IAC) */
     lbl = lv_label_create(s_scr_set);
     lv_label_set_text(lbl, "ACCENT");
@@ -1751,6 +2070,7 @@ void ui_show_settings(void) {
     update_buzzer_button(s_prev.buzzerOn);
     update_boot_button(s_prev.bootTestOn);
     theme_highlight();
+    face_highlight();
 }
 
 /* Settings button highlighting helpers — guard against NULL (page not built yet) */
@@ -1817,7 +2137,8 @@ void ui_update(const dash_data_t *d) {
         lv_obj_set_style_bg_color(s_iobox_lbl, lv_color_hex(bo ? COL_GOOD : COL_BAD), 0);
     }
 
-    /* RPM: slide star cursor over the load-up ring */
+    /* RPM: slide star cursor over the load-up ring; on the NEEDLE face rotate
+     * the pointer instead (star/ring invisible). */
     int32_t rpm = ok ? d->rpm : 0;
     if (rpm != s_last_rpm) {
         s_last_rpm = rpm;
@@ -1829,6 +2150,16 @@ void ui_update(const dash_data_t *d) {
         lv_coord_t dy = (lv_coord_t)(GAUGE_CY + GAUGE_R * 0.85f * sinf(rad));
         lv_obj_set_pos(s_mark_glow, dx - msize / 2, dy - msize / 2);
         lv_obj_set_pos(s_mark, dx - s_mark_sz / 2, dy - s_mark_sz / 2);
+        if (s_needle && s_face_active == FACE_NEEDLE) {
+            float nlen = (float)GAUGE_R * 0.62f;   /* tip just past the rail */
+            lv_point_precise_t npts[2] = {
+                { (int)(GAUGE_CX - nlen * 0.16f * cosf(rad)),
+                  (int)(GAUGE_CY - nlen * 0.16f * sinf(rad)) },
+                { (int)(GAUGE_CX + nlen * cosf(rad)),
+                  (int)(GAUGE_CY + nlen * sinf(rad)) },
+            };
+            lv_line_set_points(s_needle, npts, 2);
+        }
     }
 
     /* zone-tinted glow + load-up ring advance. Outside the rpm gate on purpose:
@@ -1889,9 +2220,10 @@ void ui_update(const dash_data_t *d) {
     lv_snprintf(buf, sizeof(buf), bstOk ? "+%d" : "--", boost);
     bar_set_val(s_bst_fill, s_bst_val, 120, bstOk, 0, 150, bstOk ? boost : 0, buf);
 
+    /* d->afr is tenths (147 = 14.7); display as "14.7" directly. */
     bool afrOk = ok && d->afr > 100 && d->afr < 2550;
-    if (afrOk) { int a10 = d->afr / 10; lv_snprintf(buf, sizeof(buf), "%d.%d", a10 / 10, a10 % 10); }
-    else { lv_snprintf(buf, sizeof(buf), "--"); }
+    if (afrOk) lv_snprintf(buf, sizeof(buf), "%d.%d", d->afr / 10, d->afr % 10);
+    else       lv_snprintf(buf, sizeof(buf), "--");
     bar_set_val(s_afr_fill, s_afr_val, 120, afrOk, 8, 20, afrOk ? d->afr / 10 : 8, buf);
     if (afrOk) {
         uint32_t c = afr_color(d->afr / 10.0f);
