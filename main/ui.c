@@ -95,7 +95,9 @@ static lv_obj_t *s_idle_lbl;
 static lv_obj_t *s_fan_lbl;
 
 static lv_obj_t *s_map_track, *s_map_fill, *s_map_lbl, *s_map_val;
+static lv_obj_t *s_bst_track, *s_bst_fill, *s_bst_lbl, *s_bst_val;
 static lv_obj_t *s_afr_track, *s_afr_fill, *s_afr_lbl, *s_afr_val;
+static lv_obj_t *s_gas_track, *s_gas_fill, *s_gas_lbl, *s_gas_val;
 static lv_obj_t *s_clt_track, *s_clt_fill, *s_clt_lbl, *s_clt_val;
 static lv_obj_t *s_tps_track, *s_tps_fill, *s_tps_lbl, *s_tps_val;
 static lv_obj_t *s_batt_track, *s_batt_fill, *s_batt_lbl, *s_batt_val;
@@ -272,10 +274,6 @@ static void settings_show_evt(lv_event_t *e);
 static void settings_back_evt(lv_event_t *e);
 static void settings_iac_target_minus_evt(lv_event_t *e);
 static void settings_iac_target_plus_evt(lv_event_t *e);
-static void settings_fan_on_minus_evt(lv_event_t *e);
-static void settings_fan_on_plus_evt(lv_event_t *e);
-static void settings_fan_off_minus_evt(lv_event_t *e);
-static void settings_fan_off_plus_evt(lv_event_t *e);
 static void settings_shift_minus_evt(lv_event_t *e);
 static void update_fan_mode_buttons(uint8_t mode);
 static void update_iac_mode_buttons(uint8_t mode);
@@ -869,8 +867,12 @@ static void ui_init_main_build(void) {
     /* bar gauges */
     create_bar(&s_map_track, &s_map_fill, &s_map_lbl, &s_map_val,
                s_scr_main, 10, 44, 48, 120, "MAP", COL_BOOST);
+    create_bar(&s_bst_track, &s_bst_fill, &s_bst_lbl, &s_bst_val,
+               s_scr_main, 62, 44, 48, 120, "BOOST", COL_BOOST);
     create_bar(&s_afr_track, &s_afr_fill, &s_afr_lbl, &s_afr_val,
                s_scr_main, 10, 210, 48, 120, "AFR", COL_AFR);
+    create_bar(&s_gas_track, &s_gas_fill, &s_gas_lbl, &s_gas_val,
+               s_scr_main, 62, 210, 48, 120, "GAS", COL_GOOD);
     create_bar(&s_clt_track, &s_clt_fill, &s_clt_lbl, &s_clt_val,
                s_scr_main, 600, 170, 63, 100, "CLT", COL_CLT);
     create_bar(&s_tps_track, &s_tps_fill, &s_tps_lbl, &s_tps_val,
@@ -1145,15 +1147,13 @@ static int8_t   s_iac_duty_val   = 50;
 static bool     s_buzz_on        = false;
 static bool     s_boottest_on    = false;
 static int16_t  s_iac_target_val = 900;    /* rpm */
-static int16_t  s_fan_on_val     = 2000;   /* F x10 */
-static int16_t  s_fan_off_val    = 1900;   /* F x10 */
 static lv_obj_t *s_shift_val_lbl, *s_duty_val_lbl, *s_buzz_lbl, *s_boot_lbl;
 static lv_obj_t *s_buzz_btn, *s_boot_btn;
 static lv_obj_t *s_gas_lbl, *s_gdamp_val_lbl, *s_glow_val_lbl;
 static lv_timer_t *s_gas_timer;
 static int16_t s_gdamp_val = 0;   /* mirror of box gasDamp */
 static int16_t s_glow_val  = 20;  /* mirror of box lowFuelPct */
-static lv_obj_t *s_tgt_val_lbl, *s_fanon_val_lbl, *s_fanoff_val_lbl;
+static lv_obj_t *s_tgt_val_lbl;
 
 /* NVS persistence for dash-side settings ("dashui" namespace).
  * app_main calls nvs_flash_init() before ui_init(), so this is safe. */
@@ -1221,7 +1221,7 @@ static void scr_set_delete_evt(lv_event_t *e) {
     s_shift_val_lbl = NULL; s_duty_val_lbl = NULL;
     s_gdamp_val_lbl = NULL; s_glow_val_lbl = NULL;
     s_gas_lbl = NULL;
-    s_tgt_val_lbl = NULL; s_fanon_val_lbl = NULL; s_fanoff_val_lbl = NULL;
+    s_tgt_val_lbl = NULL;
     for (int i = 0; i < THEME_COUNT; i++) s_btn_theme[i] = NULL;
     s_night_btn = NULL; s_night_lbl = NULL;
 }
@@ -1331,32 +1331,6 @@ static void settings_iac_target_step(int16_t d) {
 }
 static void settings_iac_target_minus_evt(lv_event_t *e) { (void)e; settings_iac_target_step(-100); }
 static void settings_iac_target_plus_evt(lv_event_t *e)  { (void)e; settings_iac_target_step(100); }
-
-static void settings_fan_on_step(int16_t d) {
-    int v = s_fan_on_val + d;
-    if (v < 1400) v = 1400;   /* 140.0F */
-    if (v > 2400) v = 2400;   /* 240.0F */
-    s_fan_on_val = (int16_t)v;
-    can_tx_fan_temp(s_fan_on_val);
-    char buf[16];
-    lv_snprintf(buf, sizeof(buf), "%d.%dF", s_fan_on_val / 10, s_fan_on_val % 10);
-    lv_label_set_text(s_fanon_val_lbl, buf);
-}
-static void settings_fan_on_minus_evt(lv_event_t *e) { (void)e; settings_fan_on_step(-10); }
-static void settings_fan_on_plus_evt(lv_event_t *e)  { (void)e; settings_fan_on_step(10); }
-
-static void settings_fan_off_step(int16_t d) {
-    int v = s_fan_off_val + d;
-    if (v < 1000) v = 1000;   /* 100.0F */
-    if (v > 2400) v = 2400;   /* 240.0F */
-    s_fan_off_val = (int16_t)v;
-    can_tx_fan_off_temp(s_fan_off_val);
-    char buf[16];
-    lv_snprintf(buf, sizeof(buf), "%d.%dF", s_fan_off_val / 10, s_fan_off_val % 10);
-    lv_label_set_text(s_fanoff_val_lbl, buf);
-}
-static void settings_fan_off_minus_evt(lv_event_t *e) { (void)e; settings_fan_off_step(-10); }
-static void settings_fan_off_plus_evt(lv_event_t *e)  { (void)e; settings_fan_off_step(10); }
 
 static void settings_shift_step(int16_t d) {
     s_shift_rpm_val += d;
@@ -1541,73 +1515,7 @@ static void build_settings(void) {
     lv_obj_set_style_text_color(s_tgt_val_lbl, lv_color_hex(COL_TEXT), 0);
     lv_obj_set_pos(s_tgt_val_lbl, 135, y + 34);
 
-    y += 80;
-
-    /* Fan ON/OFF temp */
-    lbl = lv_label_create(s_scr_set);
-    lv_label_set_text(lbl, "FAN ON TEMP (F)");
-    lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
-    lv_obj_set_pos(lbl, 10, y);
-
-    lv_obj_t *f_on_minus = lv_btn_create(s_scr_set);
-    lv_obj_add_style(f_on_minus, &btn_style, 0);
-    lv_obj_set_size(f_on_minus, 50, 40);
-    lv_obj_set_pos(f_on_minus, 10, y + 24);
-    l = lv_label_create(f_on_minus);
-    lv_label_set_text(l, "-10");
-    lv_obj_center(l);
-    lv_obj_add_event_cb(f_on_minus, settings_fan_on_minus_evt, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *f_on_plus = lv_btn_create(s_scr_set);
-    lv_obj_add_style(f_on_plus, &btn_style, 0);
-    lv_obj_set_size(f_on_plus, 50, 40);
-    lv_obj_set_pos(f_on_plus, 70, y + 24);
-    l = lv_label_create(f_on_plus);
-    lv_label_set_text(l, "+10");
-    lv_obj_center(l);
-    lv_obj_add_event_cb(f_on_plus, settings_fan_on_plus_evt, LV_EVENT_CLICKED, NULL);
-
-    s_fanon_val_lbl = lv_label_create(s_scr_set);
-    lv_snprintf(buf, sizeof(buf), "%d.%dF", s_fan_on_val / 10, s_fan_on_val % 10);
-    lv_label_set_text(s_fanon_val_lbl, buf);
-    lv_obj_set_style_text_color(s_fanon_val_lbl, lv_color_hex(COL_TEXT), 0);
-    lv_obj_set_pos(s_fanon_val_lbl, 135, y + 34);
-
-    y += 80;
-
-    /* Fan OFF temp (hysteresis) */
-    lbl = lv_label_create(s_scr_set);
-    lv_label_set_text(lbl, "FAN OFF TEMP (F)");
-    lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
-    lv_obj_set_pos(lbl, 10, y);
-
-    lv_obj_t *f_off_minus = lv_btn_create(s_scr_set);
-    lv_obj_add_style(f_off_minus, &btn_style, 0);
-    lv_obj_set_size(f_off_minus, 50, 40);
-    lv_obj_set_pos(f_off_minus, 10, y + 24);
-    l = lv_label_create(f_off_minus);
-    lv_label_set_text(l, "-10");
-    lv_obj_center(l);
-    lv_obj_add_event_cb(f_off_minus, settings_fan_off_minus_evt, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *f_off_plus = lv_btn_create(s_scr_set);
-    lv_obj_add_style(f_off_plus, &btn_style, 0);
-    lv_obj_set_size(f_off_plus, 50, 40);
-    lv_obj_set_pos(f_off_plus, 70, y + 24);
-    l = lv_label_create(f_off_plus);
-    lv_label_set_text(l, "+10");
-    lv_obj_center(l);
-    lv_obj_add_event_cb(f_off_plus, settings_fan_off_plus_evt, LV_EVENT_CLICKED, NULL);
-
-    s_fanoff_val_lbl = lv_label_create(s_scr_set);
-    lv_snprintf(buf, sizeof(buf), "%d.%dF", s_fan_off_val / 10, s_fan_off_val % 10);
-    lv_label_set_text(s_fanoff_val_lbl, buf);
-    lv_obj_set_style_text_color(s_fanoff_val_lbl, lv_color_hex(COL_TEXT), 0);
-    lv_obj_set_pos(s_fanoff_val_lbl, 135, y + 34);
-
-    y += 80;
-
-    /* Accent theme picker + night toggle (left column bottom, below FAN OFF) */
+    /* Accent theme picker + night toggle (left column bottom, below IAC) */
     lbl = lv_label_create(s_scr_set);
     lv_label_set_text(lbl, "ACCENT");
     lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
@@ -1974,6 +1882,13 @@ void ui_update(const dash_data_t *d) {
     lv_snprintf(buf, sizeof(buf), mapOk ? "%d" : "--", mapOk ? d->map / 10 : 0);
     bar_set_val(s_map_fill, s_map_val, 120, mapOk, 0, 250, mapOk ? d->map / 10 : 0, buf);
 
+    /* turbo boost = MAP above atmospheric (~100 kPa absolute). Reads 0 at
+     * vacuum/atmosphere, positive under boost; same pane as the MAP bar. */
+    int32_t boost = mapOk ? (d->map / 10) - 100 : 0;
+    bool bstOk = mapOk && boost >= 0;
+    lv_snprintf(buf, sizeof(buf), bstOk ? "+%d" : "--", boost);
+    bar_set_val(s_bst_fill, s_bst_val, 120, bstOk, 0, 150, bstOk ? boost : 0, buf);
+
     bool afrOk = ok && d->afr > 100 && d->afr < 2550;
     if (afrOk) { int a10 = d->afr / 10; lv_snprintf(buf, sizeof(buf), "%d.%d", a10 / 10, a10 % 10); }
     else { lv_snprintf(buf, sizeof(buf), "--"); }
@@ -1982,6 +1897,18 @@ void ui_update(const dash_data_t *d) {
         uint32_t c = afr_color(d->afr / 10.0f);
         lv_obj_set_style_bg_color(s_afr_fill, lv_color_hex(c), 0);
         lv_obj_set_style_text_color(s_afr_val, lv_color_hex(c), 0);
+    }
+
+    /* mini gas bar (from iobox3 0xB0 gas% telemetry, not CAN) */
+    uint8_t gpct = can_rx_get_gas();
+    bool gasOk = gpct <= 100;
+    if (gasOk) lv_snprintf(buf, sizeof(buf), "%d%%", (int)gpct);
+    else       lv_snprintf(buf, sizeof(buf), "--");
+    bar_set_val(s_gas_fill, s_gas_val, 120, gasOk, 0, 100, gasOk ? gpct : 0, buf);
+    if (gasOk) {
+        uint32_t c = (gpct <= (uint8_t)s_glow_val) ? COL_WARN : COL_GOOD;
+        lv_obj_set_style_bg_color(s_gas_fill, lv_color_hex(c), 0);
+        lv_obj_set_style_text_color(s_gas_val, lv_color_hex(c), 0);
     }
 
     bool cltOk = ok && d->clt > 100 && d->clt < 3500;
