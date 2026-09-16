@@ -70,6 +70,9 @@ static const char *s_face_names[FACE_COUNT] = { "CLS", "OEM", "NDL" };
 /* needle-pointer geometry (FACE_NEEDLE only): a line from ~0.1R behind the hub
  * out to ~0.62R, recoloured by the face colour. A hub dot covers the base. */
 static lv_obj_t *s_needle, *s_needle_hub;
+/* lv_line_set_points() stores a POINTER, not a copy — the array must live as
+ * long as the widget does. Keep one static buffer and rewrite it each tick. */
+static lv_point_precise_t s_needle_pts[2];
 
 /* star cursor (3-point, pre-rendered canvas) + zone-tinted glow halo */
 #define STARSZ 30
@@ -619,9 +622,23 @@ static void face_paint(int f, bool force) {
  * We only repaint the VISIBLE face immediately; hidden faces are marked stale
  * and repainted on next face toggle (so they're ready when shown). This keeps
  * the per-frame LVGL work under the watchdog budget. The needle's colour is an
- * object style, so we just restyle it (baked canvas colour is already tracked). */
+ * object style, so we just restyle it (baked canvas colour is already tracked).
+ * Statically-coloured bar fills (MAP/BOOST/CLT/TPS/BATT) follow the accent;
+ * AFR and GAS keep their value-driven warning colours. */
 static void ui_theme_apply(void) {
     face_paint(s_face_active, true);
+    uint32_t bar_col = accent_live();
+    lv_obj_t *static_bars[][2] = {
+        { s_map_fill,  s_map_val  },
+        { s_bst_fill,  s_bst_val  },
+        { s_clt_fill,  s_clt_val  },
+        { s_tps_fill,  s_tps_val  },
+        { s_batt_fill, s_batt_val },
+    };
+    for (size_t i = 0; i < sizeof(static_bars) / sizeof(static_bars[0]); i++) {
+        if (static_bars[i][0]) lv_obj_set_style_bg_color(static_bars[i][0], lv_color_hex(bar_col), 0);
+        if (static_bars[i][1]) lv_obj_set_style_text_color(static_bars[i][1], lv_color_hex(bar_col), 0);
+    }
     if (s_face_active == FACE_NEEDLE) {
         if (s_needle) lv_obj_set_style_line_color(s_needle, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
         if (s_needle_hub) lv_obj_set_style_bg_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
@@ -690,7 +707,7 @@ static void bar_set_val(lv_obj_t *fill, lv_obj_t *val_lbl,
 static uint32_t afr_color(float afr) {
     if (afr < 10.5f)  return COL_BAD;
     if (afr < 11.5f)  return COL_WARN;
-    if (afr <= 16.5f) return COL_GOOD;
+    if (afr <= 16.5f) return accent_live();
     if (afr <= 18.0f) return COL_WARN;
     return COL_BAD;
 }
@@ -785,6 +802,11 @@ void ui_init(void) {
 
     /* Build main UI in background but don't show yet */
     ui_init_main_build();
+
+    /* Retint everything to the loaded accent (bars, faces, needle, buttons).
+     * Without this the widgets keep their creation-time colours until the user
+     * taps an accent swatch — the first can_update_task tick applies it. */
+    s_theme_apply_pending = true;
 }
 
 /* mode: 0 = left arrow, 1 = right arrow, 2 = high beam lamp */
@@ -975,8 +997,9 @@ static void ui_init_main_build(void) {
      * plus a small hub dot. Recoloured by ui_theme_apply / face tap. */
     s_needle = lv_line_create(s_scr_main);
     lv_obj_remove_style_all(s_needle);
-    lv_line_set_points(s_needle, (const lv_point_precise_t[]){ { GAUGE_CX, GAUGE_CY },
-                                                               { GAUGE_CX, GAUGE_CY } }, 2);
+    s_needle_pts[0] = (lv_point_precise_t){ GAUGE_CX, GAUGE_CY };
+    s_needle_pts[1] = (lv_point_precise_t){ GAUGE_CX, GAUGE_CY };
+    lv_line_set_points(s_needle, s_needle_pts, 2);
     lv_obj_set_style_line_width(s_needle, 5, 0);
     lv_obj_set_style_line_color(s_needle, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
     lv_obj_set_style_line_rounded(s_needle, true, 0);
@@ -2082,11 +2105,11 @@ static void update_fan_mode_buttons(uint8_t mode) {
         bool active = (mode == i);
         if (main_btns[i]) {
             lv_obj_set_style_bg_opa(main_btns[i], active ? LV_OPA_100 : LV_OPA_50, 0);
-            lv_obj_set_style_bg_color(main_btns[i], active ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+            lv_obj_set_style_bg_color(main_btns[i], active ? lv_color_hex(accent_live()) : lv_color_hex(0x2A2A3A), 0);
         }
         if (set_btns[i]) {
             lv_obj_set_style_bg_opa(set_btns[i], active ? LV_OPA_100 : LV_OPA_50, 0);
-            lv_obj_set_style_bg_color(set_btns[i], active ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+            lv_obj_set_style_bg_color(set_btns[i], active ? lv_color_hex(accent_live()) : lv_color_hex(0x2A2A3A), 0);
         }
     }
 }
@@ -2099,11 +2122,11 @@ static void update_iac_mode_buttons(uint8_t mode) {
         bool active = (mode == i);
         if (main_btns[i]) {
             lv_obj_set_style_bg_opa(main_btns[i], active ? LV_OPA_100 : LV_OPA_50, 0);
-            lv_obj_set_style_bg_color(main_btns[i], active ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+            lv_obj_set_style_bg_color(main_btns[i], active ? lv_color_hex(accent_live()) : lv_color_hex(0x2A2A3A), 0);
         }
         if (set_btns[i]) {
             lv_obj_set_style_bg_opa(set_btns[i], active ? LV_OPA_100 : LV_OPA_50, 0);
-            lv_obj_set_style_bg_color(set_btns[i], active ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+            lv_obj_set_style_bg_color(set_btns[i], active ? lv_color_hex(accent_live()) : lv_color_hex(0x2A2A3A), 0);
         }
     }
 }
@@ -2111,14 +2134,14 @@ static void update_iac_mode_buttons(uint8_t mode) {
 static void update_buzzer_button(bool on) {
     if (!s_buzz_btn || !s_buzz_lbl) return;
     lv_obj_set_style_bg_opa(s_buzz_btn, on ? LV_OPA_100 : LV_OPA_50, 0);
-    lv_obj_set_style_bg_color(s_buzz_btn, on ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+    lv_obj_set_style_bg_color(s_buzz_btn, on ? lv_color_hex(accent_live()) : lv_color_hex(0x2A2A3A), 0);
     lv_label_set_text(s_buzz_lbl, on ? "BUZZER ON" : "BUZZER OFF");
 }
 
 static void update_boot_button(bool on) {
     if (!s_boot_btn || !s_boot_lbl) return;
     lv_obj_set_style_bg_opa(s_boot_btn, on ? LV_OPA_100 : LV_OPA_50, 0);
-    lv_obj_set_style_bg_color(s_boot_btn, on ? lv_color_hex(COL_GOOD) : lv_color_hex(0x2A2A3A), 0);
+    lv_obj_set_style_bg_color(s_boot_btn, on ? lv_color_hex(accent_live()) : lv_color_hex(0x2A2A3A), 0);
     lv_label_set_text(s_boot_lbl, on ? "BOOT TEST ON" : "BOOT TEST OFF");
 }
 
@@ -2152,13 +2175,13 @@ void ui_update(const dash_data_t *d) {
         lv_obj_set_pos(s_mark, dx - s_mark_sz / 2, dy - s_mark_sz / 2);
         if (s_needle && s_face_active == FACE_NEEDLE) {
             float nlen = (float)GAUGE_R * 0.62f;   /* tip just past the rail */
-            lv_point_precise_t npts[2] = {
-                { (int)(GAUGE_CX - nlen * 0.16f * cosf(rad)),
-                  (int)(GAUGE_CY - nlen * 0.16f * sinf(rad)) },
-                { (int)(GAUGE_CX + nlen * cosf(rad)),
-                  (int)(GAUGE_CY + nlen * sinf(rad)) },
-            };
-            lv_line_set_points(s_needle, npts, 2);
+            s_needle_pts[0] = (lv_point_precise_t){
+                (int)(GAUGE_CX - nlen * 0.16f * cosf(rad)),
+                (int)(GAUGE_CY - nlen * 0.16f * sinf(rad)) };
+            s_needle_pts[1] = (lv_point_precise_t){
+                (int)(GAUGE_CX + nlen * cosf(rad)),
+                (int)(GAUGE_CY + nlen * sinf(rad)) };
+            lv_line_set_points(s_needle, s_needle_pts, 2);
         }
     }
 
@@ -2238,7 +2261,8 @@ void ui_update(const dash_data_t *d) {
     else       lv_snprintf(buf, sizeof(buf), "--");
     bar_set_val(s_gas_fill, s_gas_val, 120, gasOk, 0, 100, gasOk ? gpct : 0, buf);
     if (gasOk) {
-        uint32_t c = (gpct <= (uint8_t)s_glow_val) ? COL_WARN : COL_GOOD;
+        /* low-fuel warning overrides the accent colour; normal range follows accent */
+        uint32_t c = (gpct <= (uint8_t)s_glow_val) ? COL_WARN : accent_live();
         lv_obj_set_style_bg_color(s_gas_fill, lv_color_hex(c), 0);
         lv_obj_set_style_text_color(s_gas_val, lv_color_hex(c), 0);
     }
