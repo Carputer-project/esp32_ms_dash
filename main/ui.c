@@ -109,6 +109,8 @@ static lv_obj_t *s_val_lbl;
 static lv_obj_t *s_can_lbl;
 static lv_obj_t *s_mat_lbl;
 static lv_obj_t *s_iobox_lbl;
+static lv_obj_t *s_speed_val, *s_speed_unit;
+static bool s_speed_unit_seen;
 static lv_obj_t *s_iac_lbl;
 static lv_obj_t *s_idle_lbl;
 static lv_obj_t *s_fan_lbl;
@@ -373,6 +375,48 @@ static uint32_t face_colour(int f) {
     return accent_live();
 }
 
+/* Dial background: TACH_FILL_CUSTOM_02 from the NFSU2 gauge pack, pre-scaled to
+ * 370x370 and embedded as a raw 8-bit luminance binary (main/gauge_bg.bin) so
+ * the blit is a 1:1 memcpy-then-expand - no runtime scaling, no LVGL transform.
+ * Stored as L8 rather than RGB565 because the art is perfectly neutral (R=G=B)
+ * and the app partition only has ~252 KB free (RGB565 would be 267 KB and 16 KB
+ * over). Written at a 10px inset (370 + 2*10 = the 390px face canvas) so it
+ * fills the dial circle exactly like the approved mockup. Additive only: every-
+ * thing painted after it (rails, redline, ticks, numbers, needle, star) is
+ * untouched. */
+extern const uint8_t gauge_bg_bin_start[] asm("_binary_gauge_bg_bin_start");
+extern const uint8_t gauge_bg_bin_end[]   asm("_binary_gauge_bg_bin_end");
+
+#define GAUGE_BG_SZ    370
+#define GAUGE_BG_INSET 10
+
+static void gauge_bg_blit(lv_obj_t *canvas) {
+    lv_draw_buf_t *db = lv_canvas_get_draw_buf(canvas);
+    if (!db || !db->data) return;
+    const uint8_t *src = gauge_bg_bin_start;
+    if ((size_t)(gauge_bg_bin_end - gauge_bg_bin_start) < (size_t)GAUGE_BG_SZ * GAUGE_BG_SZ) return;
+    uint8_t *base = db->data;
+    uint32_t stride = db->header.stride;
+    int c = GAUGE_BG_SZ / 2;
+    int rr = GAUGE_R;                     /* clip to the dial circle so the art's
+                                             square corners (not pure black) don't
+                                             paint a visible square silhouette */
+    int rr2 = rr * rr;
+    for (int y = 0; y < GAUGE_BG_SZ; y++) {
+        int dy = y - c;
+        for (int x = 0; x < GAUGE_BG_SZ; x++) {
+            int dx = x - c;
+            if (dx * dx + dy * dy > rr2) continue;
+            uint8_t v = src[(size_t)y * GAUGE_BG_SZ + (size_t)x];
+            uint16_t px = (uint16_t)(((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3));
+            uint8_t *dst = base + (size_t)(y + GAUGE_BG_INSET) * stride
+                               + (size_t)(x + GAUGE_BG_INSET) * 2;
+            dst[0] = (uint8_t)(px & 0xFF);
+            dst[1] = (uint8_t)(px >> 8);
+        }
+    }
+}
+
 static void gauge_paint_classic(lv_obj_t *parent) {
     int cx = GAUGE_CX, cy = GAUGE_CY, r = GAUGE_R;
     int sz = r * 2 + 20;
@@ -385,6 +429,7 @@ static void gauge_paint_classic(lv_obj_t *parent) {
     lv_obj_remove_style_all(canvas);
     lv_canvas_set_buffer(canvas, fbuf, sz, sz, LV_COLOR_FORMAT_RGB565);
     lv_canvas_fill_bg(canvas, lv_color_hex(COL_BG), LV_OPA_COVER);
+    gauge_bg_blit(canvas);
     lv_obj_set_pos(canvas, cx - sz / 2, cy - sz / 2);
     s_face_classic_canvas = canvas;
 
@@ -458,6 +503,7 @@ static void gauge_paint_oem(lv_obj_t *parent) {
     lv_obj_remove_style_all(canvas);
     lv_canvas_set_buffer(canvas, fbuf, sz, sz, LV_COLOR_FORMAT_RGB565);
     lv_canvas_fill_bg(canvas, lv_color_hex(COL_BG), LV_OPA_COVER);
+    gauge_bg_blit(canvas);
     lv_obj_set_pos(canvas, cx - sz / 2, cy - sz / 2);
     s_face_oem_canvas = canvas;
 
@@ -528,6 +574,7 @@ static void gauge_paint_needle(lv_obj_t *parent) {
     lv_obj_remove_style_all(canvas);
     lv_canvas_set_buffer(canvas, fbuf, sz, sz, LV_COLOR_FORMAT_RGB565);
     lv_canvas_fill_bg(canvas, lv_color_hex(COL_BG), LV_OPA_COVER);
+    gauge_bg_blit(canvas);
     lv_obj_set_pos(canvas, cx - sz / 2, cy - sz / 2);
     s_face_needle_canvas = canvas;
 
@@ -1096,7 +1143,7 @@ static void ui_init_main_build(void) {
     s_hb = lv_obj_create(s_scr_main);
     lv_obj_remove_style_all(s_hb);
     lv_obj_set_size(s_hb, 64, 26);
-    lv_obj_set_pos(s_hb, GAUGE_CX - 32, 352);
+    lv_obj_set_pos(s_hb, GAUGE_CX + 160, 8);   /* top-right: bottom-centre is the mph readout */
     lv_obj_add_flag(s_hb, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_hb, lamp_draw_cb, LV_EVENT_DRAW_MAIN, (void *)(intptr_t)2);
 
@@ -1126,6 +1173,26 @@ static void ui_init_main_build(void) {
     lv_obj_set_style_text_font(s_warn_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_warn_lbl, lv_color_hex(0xFFFFFF), 0);
     lv_label_set_text(s_warn_lbl, "");
+
+    /* big mph readout: iobox3 ABS speed (0xB0 byte 2). Stacked directly below
+     * the RPM number, in the dial's bottom gap (classic tach odometer spot).
+     * Draws on top of the needle by construction (created after it). */
+    s_speed_val = lv_label_create(s_scr_main);
+    lv_label_set_text(s_speed_val, "--");
+    lv_obj_set_style_text_color(s_speed_val, lv_color_hex(COL_TEXT), 0);
+    lv_obj_set_style_text_font(s_speed_val, &lv_font_montserrat_30, 0);
+    lv_obj_set_width(s_speed_val, 150);
+    lv_obj_set_style_text_align(s_speed_val, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_speed_val, GAUGE_CX - 75, 350);
+
+    s_speed_unit = lv_label_create(s_scr_main);
+    lv_label_set_text(s_speed_unit, "MPH");
+    lv_obj_set_style_text_color(s_speed_unit, lv_color_hex(COL_DIM), 0);
+    lv_obj_set_style_text_font(s_speed_unit, &lv_font_montserrat_14, 0);
+    lv_obj_set_width(s_speed_unit, 60);
+    lv_obj_set_style_text_align(s_speed_unit, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_speed_unit, GAUGE_CX - 30, 383);
+    lv_obj_add_flag(s_speed_unit, LV_OBJ_FLAG_HIDDEN);
 
     /* status labels */
     s_idle_lbl = lv_label_create(s_scr_main);
@@ -2230,6 +2297,21 @@ void ui_update(const dash_data_t *d) {
     lv_snprintf(buf, sizeof(buf), ok ? "%d" : "--", (int)rpm);
     if (strcmp(lv_label_get_text(s_val_lbl), buf) != 0)
         lv_label_set_text(s_val_lbl, buf);
+
+    /* big mph readout (0xB0 byte 2 from iobox3 ABS speed). Gated on the
+     * ESP-NOW link so a dead box shows "--" instead of a frozen 0. */
+    uint8_t spd = can_rx_get_speed();
+    bool spdOk = d->ioboxOk && spd <= 250;
+    lv_snprintf(buf, sizeof(buf), spdOk ? "%d" : "--", (int)spd);
+    if (strcmp(lv_label_get_text(s_speed_val), buf) != 0) {
+        lv_label_set_text(s_speed_val, buf);
+        bool showUnit = spdOk;
+        if (showUnit != s_speed_unit_seen) {
+            s_speed_unit_seen = showUnit;
+            if (showUnit) lv_obj_clear_flag(s_speed_unit, LV_OBJ_FLAG_HIDDEN);
+            else          lv_obj_add_flag(s_speed_unit, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 
     /* bars */
     bool mapOk = ok && d->map > 0 && d->map < 4000;

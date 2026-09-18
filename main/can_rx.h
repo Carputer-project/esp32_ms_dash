@@ -32,6 +32,7 @@ typedef struct {
     uint8_t  iacMode;      // 0=man, 1=auto, 2=follow (from iobox3 0xB0)
     bool     buzzerOn;     // from iobox3 0xB0
     bool     bootTestOn;   // from iobox3 0xB0
+    uint8_t  speedMph;     // from iobox3 0xB0 f[2] (ABS/LM393 input)
     uint32_t lastRxMs;
     uint32_t lastSdbMs;
 } dash_data_t;
@@ -67,5 +68,7 @@ uint8_t can_rx_get_fan_mode(void);         /* last box-echoed fan mode (0/1/2) *
 uint8_t can_rx_get_iac_mode(void);         /* last box-echoed iac mode (0/1/2) */
 uint8_t can_rx_get_buzzer_on(void);        /* last box-echoed buzzer state (0/1) */
 uint8_t can_rx_get_boot_test(void);        /* last box-echoed boot-test state (0/1) */
+void can_rx_set_speed(uint8_t mph);        /* B0 v5 byte [2]: 0-255 mph, 255 = none yet */
+uint8_t can_rx_get_speed(void);            /* last reported speed, 255 = none yet */
 
 #endif

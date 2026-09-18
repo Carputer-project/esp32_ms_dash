@@ -204,6 +204,7 @@ static void can_rx_task(void *arg)
             s_data.iacMode   = can_rx_get_iac_mode();
             s_data.buzzerOn  = can_rx_get_buzzer_on();
             s_data.bootTestOn = can_rx_get_boot_test();
+            s_data.speedMph  = can_rx_get_speed();
             s_data.lastRxMs = s_lastRxMs;
             s_data.lastSdbMs = s_lastSdbMs;
 
@@ -376,3 +377,8 @@ void can_rx_set_buzzer_on(uint8_t on)     { s_buzzerOn = on; }
 uint8_t can_rx_get_buzzer_on(void)       { return s_buzzerOn; }
 void can_rx_set_boot_test(uint8_t on)     { s_bootTestOn = on; }
 uint8_t can_rx_get_boot_test(void)       { return s_bootTestOn; }
+
+/* Speed mph from B0 v5 telemetry byte [2]. 255 = no telemetry seen yet. */
+static volatile uint8_t s_speedMph = 255;
+void can_rx_set_speed(uint8_t mph) { s_speedMph = mph; }
+uint8_t can_rx_get_speed(void)     { return s_speedMph; }

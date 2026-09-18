@@ -33,6 +33,9 @@ static void link_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, i
     if (data[0] == FRAME_STATUS && len >= 8) {
         s_rxB0Count++;
         can_rx_set_dash_status(data[1], data[4]);
+        if (len >= 3) {
+            can_rx_set_speed(data[2]);                          /* v5: speed mph */
+        }
         if (len >= 14) {
             can_rx_set_gas(data[5]);                              /* v3: gas% */
             can_rx_set_a4mv(data[12] | (data[13] << 8));          /* v2: A4 source-mV */

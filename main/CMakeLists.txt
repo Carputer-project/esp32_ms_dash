@@ -8,7 +8,9 @@ idf_component_register(
         "../components/waveshare_rgb_lcd_port.c"
     INCLUDE_DIRS
         "."
-        "../components")
+        "../components"
+    EMBED_FILES
+        "gauge_bg.bin")
 
 idf_build_get_property(build_components BUILD_COMPONENTS)
 if("lvgl" IN_LIST build_components)
