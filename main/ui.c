@@ -159,6 +159,7 @@ static const uint32_t s_theme_colors[THEME_COUNT] = { COL_GOOD, COL_AFR, COL_MAG
 static uint32_t s_accent = COL_GOOD;   /* current accent colour */
 static bool     s_night  = false;      /* reduced-glare night mode */
 static bool     s_theme_dirty = false;      /* theme or night changed; persist pending */
+static bool     s_shift_dirty = false;      /* shift-rpm changed; persist pending */
 bool     s_theme_apply_pending = false; /* theme changed; ui_theme_apply_once() needed */
 static lv_obj_t *s_btn_theme[THEME_COUNT];
 static lv_obj_t *s_night_btn;
@@ -172,8 +173,8 @@ static lv_obj_t *s_face_lbl[FACE_COUNT];
  * single warn byte truncates away. Defaults mirror the iobox3 engine profile;
  * tunable via NVS ("dashui" / "w_*") — no settings UI yet. Values are x10
  * (clt/mat/batt/map) like the rest of the dash data. */
-static int16_t s_warn_clt_max   = 2300;   /* coolant 230 C */
-static int16_t s_warn_mat_max   = 1600;   /* intake  160 C */
+static int16_t s_warn_clt_max   = 2300;   /* coolant 230.0 F (x10) */
+static int16_t s_warn_mat_max   = 1600;   /* intake  160.0 F (x10) */
 static int16_t s_warn_batt_min  = 110;    /* 11.0 V */
 static int16_t s_warn_batt_max  = 160;    /* 16.0 V */
 static int16_t s_warn_map_max   = 2800;   /* 280 kPa */
@@ -1129,7 +1130,7 @@ static void ui_init_main_build(void) {
     s_ind_l = lv_obj_create(s_scr_main);
     lv_obj_remove_style_all(s_ind_l);
     lv_obj_set_size(s_ind_l, 56, 44);
-    lv_obj_set_pos(s_ind_l, 84, 48);
+    lv_obj_set_pos(s_ind_l, 124, 48);   /* x shifted right of the BOOST bar (x62..110) */
     lv_obj_add_flag(s_ind_l, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_ind_l, lamp_draw_cb, LV_EVENT_DRAW_MAIN, (void *)(intptr_t)0);
 
@@ -1358,6 +1359,7 @@ static void face_toggle_evt(lv_event_t *e) {
         }
         if (nxt != s_face_active) {
             s_face_active = nxt;
+            s_last_rpm = -9999;   /* force needle repaint for the new face */
             lv_obj_t *faces[FACE_COUNT] = { s_face_classic, s_face_oem, s_face_needle };
             for (int i = 0; i < FACE_COUNT; i++)
                 if (faces[i]) lv_obj_add_flag(faces[i], LV_OBJ_FLAG_HIDDEN);
@@ -1384,7 +1386,7 @@ static void face_toggle_evt(lv_event_t *e) {
  * real stack. Flash write outside the touch/render context is safe. */
 void ui_face_persist_once(void)
 {
-    if (!s_face_dirty && !s_theme_dirty) return;
+    if (!s_face_dirty && !s_theme_dirty && !s_shift_dirty) return;
     nvs_handle_t h;
     if (nvs_open("dashui", NVS_READWRITE, &h) == ESP_OK) {
         if (s_face_dirty) {
@@ -1400,6 +1402,10 @@ void ui_face_persist_once(void)
             nvs_set_i32(h, "accent", (int32_t)s_accent);
             nvs_set_i32(h, "night",  s_night ? 1 : 0);
             s_theme_dirty = false;
+        }
+        if (s_shift_dirty) {
+            nvs_set_i32(h, "shift_rpm", s_shift_rpm_cfg);
+            s_shift_dirty = false;
         }
         nvs_commit(h);
         nvs_close(h);
@@ -1446,9 +1452,11 @@ static void iac_follow_evt(lv_event_t *e) {
     can_tx_iac_follow(true);
 }
 
+static int8_t s_iac_duty_val = 50;   /* default MAN duty % (also used by settings page) */
+
 static void iac_man_evt(lv_event_t *e) {
     (void)e;
-    can_tx_iac_manual(50);  /* default 50% */
+    can_tx_iac_manual((uint8_t)s_iac_duty_val);
 }
 
 static void ui_init_main_show(void) {
@@ -1462,7 +1470,6 @@ static void ui_init_main_show(void) {
  * ============================================================================ */
 
 static int16_t  s_shift_rpm_val  = SHIFT_RPM_DEFAULT;
-static int8_t   s_iac_duty_val   = 50;
 static bool     s_buzz_on        = false;
 static bool     s_boottest_on    = false;
 static int16_t  s_iac_target_val = 900;    /* rpm */
@@ -1515,15 +1522,6 @@ static void settings_nvs_load(void) {
                 if ((uint32_t)v == s_theme_colors[i]) { s_accent = (uint32_t)v; break; }
         if (nvs_get_i32(h, "night", &v) == ESP_OK && v >= 0 && v <= 1)
             s_night = (v == 1);
-        nvs_close(h);
-    }
-}
-
-static void settings_nvs_save_shift(void) {
-    nvs_handle_t h;
-    if (nvs_open("dashui", NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, "shift_rpm", s_shift_rpm_cfg);
-        nvs_commit(h);
         nvs_close(h);
     }
 }
@@ -1704,7 +1702,7 @@ static void gas_timer_cb(lv_timer_t *t) {
     else if (g <= 100)
         lv_snprintf(buf, sizeof(buf), "GAS %u%%", g);
     else
-        lv_snprintf(buf, sizeof(buf), "GAS --%");
+        lv_snprintf(buf, sizeof(buf), "GAS --%%");
     lv_label_set_text(s_gas_lbl, buf);
 }
 
@@ -1726,7 +1724,7 @@ static void settings_shift_step(int16_t d) {
     if (s_shift_rpm_val < 4000) s_shift_rpm_val = 4000;
     if (s_shift_rpm_val > 9000) s_shift_rpm_val = 9000;
     s_shift_rpm_cfg = s_shift_rpm_val;      /* drive the on-screen strip too */
-    settings_nvs_save_shift();
+    s_shift_dirty = true;                   /* NVS write deferred to ui_persist_task */
     can_tx_shift_rpm(s_shift_rpm_val);      /* keep iobox O1 threshold in step */
     char buf[16];
     lv_snprintf(buf, sizeof(buf), "%d", s_shift_rpm_val);
@@ -2326,7 +2324,7 @@ void ui_update(const dash_data_t *d) {
     bar_set_val(s_bst_fill, s_bst_val, 120, bstOk, 0, 150, bstOk ? boost : 0, buf);
 
     /* d->afr is tenths (147 = 14.7); display as "14.7" directly. */
-    bool afrOk = ok && d->afr > 100 && d->afr < 2550;
+    bool afrOk = ok && d->afr >= 90 && d->afr < 2550;   /* >=90: RICH band (afr<100) still shows a value */
     if (afrOk) lv_snprintf(buf, sizeof(buf), "%d.%d", d->afr / 10, d->afr % 10);
     else       lv_snprintf(buf, sizeof(buf), "--");
     bar_set_val(s_afr_fill, s_afr_val, 120, afrOk, 8, 20, afrOk ? d->afr / 10 : 8, buf);
@@ -2338,7 +2336,7 @@ void ui_update(const dash_data_t *d) {
 
     /* mini gas bar (from iobox3 0xB0 gas% telemetry, not CAN) */
     uint8_t gpct = can_rx_get_gas();
-    bool gasOk = gpct <= 100;
+    bool gasOk = d->ioboxOk && gpct <= 100;   /* dead link -> "--", not frozen value */
     if (gasOk) lv_snprintf(buf, sizeof(buf), "%d%%", (int)gpct);
     else       lv_snprintf(buf, sizeof(buf), "--");
     bar_set_val(s_gas_fill, s_gas_val, 120, gasOk, 0, 100, gasOk ? gpct : 0, buf);
@@ -2382,6 +2380,23 @@ void ui_update(const dash_data_t *d) {
     }
     if (strcmp(lv_label_get_text(s_iac_lbl), buf) != 0)
         lv_label_set_text(s_iac_lbl, buf);
+
+    /* IDLE/FAN status labels follow the iobox3 mode echoes (gated on link
+     * health so a dead box shows "--" instead of a frozen mode). */
+    const char *idle_txt, *fan_txt;
+    if (d->ioboxOk) {
+        idle_txt = (d->iacMode == 0) ? "IDLE MAN"
+                 : (d->iacMode == 2) ? "IDLE FOL" : "IDLE AUTO";
+        fan_txt  = (d->fanMode == 0) ? "FAN OFF"
+                 : (d->fanMode == 2) ? "FAN ON"  : "FAN AUTO";
+    } else {
+        idle_txt = "IDLE --";
+        fan_txt  = "FAN --";
+    }
+    if (strcmp(lv_label_get_text(s_idle_lbl), idle_txt) != 0)
+        lv_label_set_text(s_idle_lbl, idle_txt);
+    if (strcmp(lv_label_get_text(s_fan_lbl), fan_txt) != 0)
+        lv_label_set_text(s_fan_lbl, fan_txt);
 
     /* indicators blink ~1.4Hz while latched; high beam steady.
      * NOTE: no canOk gate — these come from the ESP-NOW link and are

@@ -174,12 +174,12 @@ static void can_rx_task(void *arg)
         if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             int32_t rawRpm, rawMap, rawClt, rawMat, rawTps, rawBatt, rawAfr, rawBaro;
             int16_t rawIac;
-            rawRpm  = fresh ? rdU16(6)  : (sdbFresh ? rdU16be(&s_sdb[2], 2) : 0);
-            rawMap  = fresh ? rdS16(18) : (sdbFresh ? rdS16be(&s_sdb[0], 0) : 0);
-            rawClt  = fresh ? rdS16(22) : (sdbFresh ? rdS16be(&s_sdb[4], 4) : 0);
-            rawMat  = fresh ? rdS16(20) : (sdbFresh ? rdS16be(&s_sdb[8], 4) : 0);
-            rawTps  = fresh ? rdS16(24) : (sdbFresh ? rdS16be(&s_sdb[6], 6) : 0);
-            rawBatt = fresh ? rdS16(26) : (sdbFresh ? rdS16be(&s_sdb[22], 6) : 0);
+            rawRpm  = fresh ? rdU16(6)  : (sdbFresh ? rdU16be(&s_sdb[2], 0)  : 0);
+            rawMap  = fresh ? rdS16(18) : (sdbFresh ? rdS16be(&s_sdb[0], 0)  : 0);
+            rawClt  = fresh ? rdS16(22) : (sdbFresh ? rdS16be(&s_sdb[4], 0)  : 0);
+            rawMat  = fresh ? rdS16(20) : (sdbFresh ? rdS16be(&s_sdb[12], 0) : 0);
+            rawTps  = fresh ? rdS16(24) : (sdbFresh ? rdS16be(&s_sdb[6], 0)  : 0);
+            rawBatt = fresh ? rdS16(26) : (sdbFresh ? rdS16be(&s_sdb[24], 0) : 0);
             rawAfr  = fresh ? rdS16(28) : 0;
             rawIac  = fresh ? rdS16(54) : 0;
             rawBaro = fresh ? rdS16(16) : 1000;
@@ -200,10 +200,12 @@ static void can_rx_task(void *arg)
             s_data.indR   = dashFresh && (s_dashB0 & 0x02);
             s_data.highBeam = dashFresh && (s_dashB0 & 0x04);
             s_data.ioboxOk = dashFresh;
-            s_data.fanMode   = can_rx_get_fan_mode();
-            s_data.iacMode   = can_rx_get_iac_mode();
-            s_data.buzzerOn  = can_rx_get_buzzer_on();
-            s_data.bootTestOn = can_rx_get_boot_test();
+            /* Box mode echoes: gate on link health so a dead link shows
+             * "unknown" (0xFF / false) instead of the last frozen mode. */
+            s_data.fanMode   = dashFresh ? can_rx_get_fan_mode()   : 0xFF;
+            s_data.iacMode   = dashFresh ? can_rx_get_iac_mode()   : 0xFF;
+            s_data.buzzerOn  = dashFresh && can_rx_get_buzzer_on();
+            s_data.bootTestOn = dashFresh && can_rx_get_boot_test();
             s_data.speedMph  = can_rx_get_speed();
             s_data.lastRxMs = s_lastRxMs;
             s_data.lastSdbMs = s_lastSdbMs;
