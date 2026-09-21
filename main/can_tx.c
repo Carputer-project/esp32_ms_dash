@@ -73,10 +73,6 @@ esp_err_t can_tx_boottest(bool on) {
     return can_tx_send_cmd('Z', on ? "1" : "0");
 }
 
-esp_err_t can_tx_gas_record(const char *slot) {
-    return can_tx_send_cmd('Q', slot);
-}
-
 esp_err_t can_tx_led(uint8_t r, uint8_t g, uint8_t b) {
     char val[16];
     snprintf(val, sizeof(val), "%u %u %u", r, g, b);

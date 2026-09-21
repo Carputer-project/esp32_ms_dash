@@ -23,7 +23,6 @@ esp_err_t can_tx_shift_rpm(int16_t rpm);
 esp_err_t can_tx_buzzer(bool on);
 esp_err_t can_tx_buzzer_test(void);
 esp_err_t can_tx_boottest(bool on);
-esp_err_t can_tx_gas_record(const char *slot);  /* 'Q' <slot> — slot: F,3,2,1,E */
 
 esp_err_t can_tx_led(uint8_t r, uint8_t g, uint8_t b);
 esp_err_t can_tx_led_off(void);

@@ -1556,15 +1556,11 @@ static void scr_set_delete_evt(lv_event_t *e) {
     s_night_btn = NULL; s_night_lbl = NULL;
 }
 
-/* Fuel calibration — sends Q <slot> to iobox3 over the link; box records its
- * current A4 node reading into the 5-point table (E,1/4,HALF,3/4,F) and
- * persists to NVS. Damp/low-fuel steppers mirror Q D / Q W. */
-static const char *const kGasSlots[5] = { "E", "1", "2", "3", "F" };
-
-static void settings_gas_set_evt(lv_event_t *e) {
-    uintptr_t idx = (uintptr_t)lv_event_get_user_data(e);
-    if (idx < 5) can_tx_gas_record(kGasSlots[idx]);
-}
+/* Gas cal removed from the dash 2026-09-21 — the 5 SET buttons used to fire
+ * Q <slot> over the link and re-anchor the box's fuel table (E,1/4,HALF,3/4,F).
+ * Too easy to fat-finger on a bright dash; calibration now lives on the box's
+ * serial Q handler only. The read-only GAS %/mV label + damp/low-fuel steppers
+ * below stay. */
 
 /* Accent theme picker + night toggle (dash-side, persisted to NVS). */
 static void theme_highlight(void);
@@ -2059,17 +2055,7 @@ static void build_settings(void) {
     lv_obj_set_pos(s_gas_lbl, rx + 130, 360);
     s_gas_timer = lv_timer_create(gas_timer_cb, 500, NULL);
 
-    static const char *gas_lbls[5] = { "SET E", "1/4", "1/2", "3/4", "SET F" };
-    for (int i = 0; i < 5; i++) {
-        lv_obj_t *b = lv_btn_create(s_scr_set);
-        lv_obj_add_style(b, &btn_style, 0);
-        lv_obj_set_size(b, 66, 34);
-        lv_obj_set_pos(b, rx + i * 70, 386);
-        l = lv_label_create(b);
-        lv_label_set_text(l, gas_lbls[i]);
-        lv_obj_center(l);
-        lv_obj_add_event_cb(b, settings_gas_set_evt, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
-    }
+    /* Gas-cal SET buttons removed 2026-09-21 — calibration is box-serial only. */
 
     /* Damping + low-fuel steppers, compact second row */
     lbl = lv_label_create(s_scr_set);
