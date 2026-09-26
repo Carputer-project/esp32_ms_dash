@@ -17,12 +17,17 @@ esp_err_t can_tx_iac_follow(bool follow);
 esp_err_t can_tx_iac_manual(uint8_t duty_pct);
 esp_err_t can_tx_iac_target_rpm(int16_t rpm);
 
-esp_err_t can_tx_fan_output(uint8_t channel);
-esp_err_t can_tx_shift_rpm(int16_t rpm);
+/* NOTE: can_tx_shift_rpm ('S') and can_tx_fan_output ('Y') were deleted — 'S'
+ * re-arms box O1 into shift-light OM_RPM mode (sabotages the table-switch pin)
+ * and neither had callers. If shift-light control ever returns it must go
+ * through a dedicated output, not the MS table-switch pin. */
+
+/* Launch arm / table switch are CAN-only since 2026-09-25 — the dash CAN
+ * responder drives ECU Remote Port3 bits; the iobox3 O-outputs (O2/O3) are
+ * freed and no longer commanded (see can_rx_set_launch_btn/set_table_btn). */
 
 esp_err_t can_tx_buzzer(bool on);
 esp_err_t can_tx_buzzer_test(void);
-esp_err_t can_tx_boottest(bool on);
 
 esp_err_t can_tx_led(uint8_t r, uint8_t g, uint8_t b);
 esp_err_t can_tx_led_off(void);

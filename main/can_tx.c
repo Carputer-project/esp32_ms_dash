@@ -48,29 +48,12 @@ esp_err_t can_tx_iac_target_rpm(int16_t rpm) {
     return can_tx_send_cmd('T', val);
 }
 
-esp_err_t can_tx_fan_output(uint8_t channel) {
-    char val[8];
-    snprintf(val, sizeof(val), "%d", channel);
-    return can_tx_send_cmd('Y', val);
-}
-
-esp_err_t can_tx_shift_rpm(int16_t rpm) {
-    if (rpm <= 0) return ESP_ERR_INVALID_ARG;
-    char val[8];
-    snprintf(val, sizeof(val), "%d", rpm);
-    return can_tx_send_cmd('S', val);
-}
-
 esp_err_t can_tx_buzzer(bool on) {
     return can_tx_send_cmd('B', on ? "1" : "0");
 }
 
 esp_err_t can_tx_buzzer_test(void) {
     return can_tx_send_cmd('B', "T");
-}
-
-esp_err_t can_tx_boottest(bool on) {
-    return can_tx_send_cmd('Z', on ? "1" : "0");
 }
 
 esp_err_t can_tx_led(uint8_t r, uint8_t g, uint8_t b) {

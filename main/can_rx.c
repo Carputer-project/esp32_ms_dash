@@ -25,8 +25,8 @@ static can_stats_t s_stats;
 static SemaphoreHandle_t s_data_mutex;
 static SemaphoreHandle_t s_stats_mutex;
 
-static uint8_t  s_outpc[CAN_GROUPS * 8];
-static bool     s_seen[CAN_GROUPS];
+static uint8_t  s_outpc[CAN_RX_GROUPS * 8];
+static bool     s_seen[CAN_RX_GROUPS];
 static uint8_t  s_sdb[CAN_SDB_MSGS * 8];
 static bool     s_sdbSeen[CAN_SDB_MSGS];
 static uint32_t s_lastRxMs = 0;
@@ -36,20 +36,58 @@ static uint8_t  s_dashB0 = 0;
 static uint8_t  s_dashB3 = 0;
 static bool     s_dashSeen = false;
 
+/* ---- CAN Remote Port probe (2026-09-24, temporary) ----
+ * Logs unseen extended frames, answers the ECU's MS2/Extra CAN-poll ports
+ * request (MSG_REQ) with a MSG_RSP "push" of 2 bytes into outpc gpioport[1..2]
+ * (Remote Port 3 = gpioport[2]), and prints the ECU's own fuel-switch status
+ * bit (status1 bit5 ftblsw) transitions as the acceptance proof.
+ * s_remotePorts: bit1 SET = VE1 / CLEARED = VE3; bit0 SET = launch released /
+ * CLEARED = launch active (active-low, mirrors a pulled-up physical input). */
+#define PROBE_MSG_RSP 2u
+static volatile uint8_t s_remotePorts = 0x03u;   /* default: VE1 + launch released */
+static uint32_t s_extFrames      = 0;
+static uint32_t s_portsPollSeen  = 0;
+static uint32_t s_portsRespSent  = 0;
+static uint32_t s_portsPollId    = 0;      /* wire ID of the ECU's ports poll */
+static uint32_t s_rspId          = 0;      /* wire ID we transmit back */
+static uint32_t s_extSeen[8];
+static uint32_t s_extCnt[8];
+static uint8_t  s_extSeenN = 0;
+
+void can_rx_set_table_btn(bool on) {
+    s_remotePorts = (uint8_t)((s_remotePorts & ~0x02u) | (on ? 0x00u : 0x02u));
+}
+void can_rx_set_launch_btn(bool armed) {
+    s_remotePorts = (uint8_t)((s_remotePorts & ~0x01u) | (armed ? 0x00u : 0x01u));
+}
+
+uint8_t can_rx_probe_ports(void) {
+    return s_remotePorts;
+}
+
 uint8_t can_rx_get_fan_mode(void);
 uint8_t can_rx_get_iac_mode(void);
 uint8_t can_rx_get_buzzer_on(void);
-uint8_t can_rx_get_boot_test(void);
 
-static int32_t s_maRpm[MA_WINDOW];
-static int32_t s_maMap[MA_WINDOW];
-static int32_t s_maClt[MA_WINDOW];
-static int32_t s_maMat[MA_WINDOW];
-static int32_t s_maTps[MA_WINDOW];
-static int32_t s_maBatt[MA_WINDOW];
-static int32_t s_maAfr[MA_WINDOW];
-static uint8_t s_maIdx = 0;
-static uint8_t s_maCount = 0;
+/* Moving-average window, one index/count pair PER channel. Shared state across
+ * channels breaks slot coverage if the channel count and MA_WINDOW ever share
+ * a divisor >1 (e.g. 8 channels vs. 10: gcd=2 -> half of every buffer never
+ * gets written, diluting every average ~50%). Keep idx/count bundled with the
+ * buffer so channel count and MA_WINDOW are independent. */
+typedef struct {
+    int32_t buf[MA_WINDOW];
+    uint8_t idx;
+    uint8_t count;
+} ma_t;
+
+static ma_t s_maRpm, s_maMap, s_maClt, s_maMat, s_maTps, s_maBatt, s_maAfr;
+
+/* AFR/IAC have NO SDB source. When the primary outpc stream drops but the SDB
+ * broadcast is still alive, holding the last known values (rather than 0) keeps
+ * the AFR average from being dragged through the RICH threshold and stops
+ * "IAC 0%" showing during what is a data-loss event, not a fueling event. */
+static int32_t s_lastAfr = 0;
+static int16_t s_lastIac = 0;
 
 static inline uint16_t rdU16(uint8_t off) {
     return (uint16_t)((s_outpc[off] << 8) | s_outpc[off + 1]);
@@ -67,17 +105,13 @@ static inline int16_t rdS16be(const uint8_t *d, uint8_t off) {
     return (int16_t)rdU16be(d, off);
 }
 
-static int32_t maPush(int32_t *buf, int32_t val) {
-    if (s_maCount >= MA_WINDOW) {
-        buf[s_maIdx] = val;
-    } else {
-        buf[s_maIdx] = val;
-        s_maCount++;
-    }
+static int32_t maPush(ma_t *ma, int32_t val) {
+    ma->buf[ma->idx] = val;
+    if (ma->count < MA_WINDOW) ma->count++;
     int64_t sum = 0;
-    for (int i = 0; i < s_maCount; i++) sum += buf[i];
-    s_maIdx = (s_maIdx + 1) % MA_WINDOW;
-    return sum / s_maCount;
+    for (int i = 0; i < ma->count; i++) sum += ma->buf[i];
+    ma->idx = (uint8_t)((ma->idx + 1) % MA_WINDOW);
+    return (int32_t)(sum / ma->count);
 }
 
 static void can_rx_task(void *arg)
@@ -120,7 +154,7 @@ static void can_rx_task(void *arg)
                 continue;
             }
 
-            if (msg.identifier >= CAN_BASE_ID && msg.identifier < CAN_BASE_ID + CAN_GROUPS) {
+            if (msg.identifier >= CAN_BASE_ID && msg.identifier < CAN_BASE_ID + CAN_RX_GROUPS) {
                 uint8_t grp = (uint8_t)(msg.identifier - CAN_BASE_ID);
                 uint8_t dlc = msg.data_length_code > 8 ? 8 : msg.data_length_code;
                 if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -132,6 +166,53 @@ static void can_rx_task(void *arg)
                 s_lastRxMs = esp_timer_get_time() / 1000;
 
             }
+
+            /* ---- PROBE: extended frames (ECU CAN polls + anything else) ---- */
+            if (msg.extd) {
+                s_extFrames++;
+                bool known = false;
+                for (uint8_t i = 0; i < s_extSeenN; i++) {
+                    if (s_extSeen[i] == msg.identifier) { s_extCnt[i]++; known = true; break; }
+                }
+                if (!known && s_extSeenN < 8) {
+                    s_extSeen[s_extSeenN] = msg.identifier;
+                    s_extCnt[s_extSeenN] = 1;
+                    printf("[CAN] EXT id=0x%X dlc=%u data=", (unsigned)msg.identifier,
+                           msg.data_length_code);
+                    for (uint8_t i = 0; i < msg.data_length_code; i++) printf("%02X ", msg.data[i]);
+                    printf("\n");
+                    s_extSeenN++;
+                }
+
+                /* MS2/Extra ports poll request: MSG_REQ, reply-to table 7, 2 bytes
+                 * requested (ADC polls request 8 bytes -> excluded by mask). */
+                if (msg.data_length_code >= 3 && msg.data[0] == 7 && (msg.data[2] & 0x1F) == 2) {
+                    s_portsPollSeen++;
+                    if (s_portsPollId == 0) s_portsPollId = msg.identifier;
+                    /* payload: {rem_table=7, rem_off>>3, ((rem_off&7)<<5)|2} */
+                    uint32_t var_off = ((uint32_t)msg.data[1] << 3) | (msg.data[2] >> 5);
+                    /* Response wire ID, built from the ECU's own ISR/acceptance
+                     * decode (verified 2026-09-24 against observed poll 0x13082B8:
+                     * var_off=ID[28:18], msg_type=ID[17:15], From=ID[14:11],
+                     * To=ID[10:7] (must = CANid 0 for bank-1 accept), var_blk 7
+                     * = 0b0111000 at ID[6:0] -> 0x38). SRR/IDE are inserted by
+                     * the controller automatically for extended frames. */
+                    uint32_t rsp_id = (var_off & 0x7FFu) << 18;      /* ID[28:18] = 167 */
+                    rsp_id |= ((uint32_t)PROBE_MSG_RSP & 0x7u) << 15; /* ID[17:15] = 2 */
+                    rsp_id |= 5u << 11;                               /* ID[14:11] = From = CANid 5 (tune can_poll_id) */
+                    rsp_id |= 0x38u;                                 /* ID[6:0] = var_blk 7 */
+                    twai_message_t rsp = {0};
+                    rsp.identifier = rsp_id;
+                    rsp.extd = true;
+                    rsp.data_length_code = 2;
+                    rsp.data[0] = 0x00;                        /* gpioport[1] unused */
+                    rsp.data[1] = (uint8_t)s_remotePorts;      /* gpioport[2] = Remote Port3 */
+                    if (twai_transmit(&rsp, pdMS_TO_TICKS(10)) == ESP_OK) {
+                        s_portsRespSent++;
+                        s_rspId = rsp_id;
+                    }
+                }
+            }
         }
 
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -141,9 +222,11 @@ static void can_rx_task(void *arg)
             s_stats.frames_per_sec = fps;
             s_stats.last_sec_frame_count = s_stats.total_frames;
             s_stats.last_sec_time_ms = now_ms;
-            printf("[CAN] Stats: FPS=%" PRIu32 " Total=%" PRIu32 " Err=%" PRIu32 " BusOff=%" PRIu32 "\n",
+            printf("[CAN] Stats: FPS=%" PRIu32 " Total=%" PRIu32 " Err=%" PRIu32 " BusOff=%" PRIu32
+                   " Ext=%" PRIu32 " Polls=%" PRIu32 " Resp=%" PRIu32 "\n",
                      fps, s_stats.total_frames,
-                     s_stats.error_frames, s_stats.bus_off_count);
+                     s_stats.error_frames, s_stats.bus_off_count,
+                     s_extFrames, s_portsPollSeen, s_portsRespSent);
         }
 
         // Print TWAI status every 10 seconds
@@ -180,19 +263,53 @@ static void can_rx_task(void *arg)
             rawMat  = fresh ? rdS16(20) : (sdbFresh ? rdS16be(&s_sdb[12], 0) : 0);
             rawTps  = fresh ? rdS16(24) : (sdbFresh ? rdS16be(&s_sdb[6], 0)  : 0);
             rawBatt = fresh ? rdS16(26) : (sdbFresh ? rdS16be(&s_sdb[24], 0) : 0);
-            rawAfr  = fresh ? rdS16(28) : 0;
-            rawIac  = fresh ? rdS16(54) : 0;
+            if (fresh) {
+                s_lastAfr = rdS16(28);
+                s_lastIac = rdS16(54);
+            }
+            rawAfr  = s_lastAfr;
+            rawIac  = s_lastIac;
             rawBaro = fresh ? rdS16(16) : 1000;
+
+            /* Spark table + rev-lim from gp10 status bytes, live timing from
+             * gp01 (adv_deg @8). status1 bit6 stblsw = 3rd spark table active
+             * (T3); status3 bit5 REVLIMSFT = soft/hard rev limiter engaged. */
+            bool stSeen = s_seen[10];
+            s_data.fuelTable = (fresh && stSeen) ? ((s_outpc[80] & 0x20) ? 3 : 1) : 0;  /* ftblsw bit5 -> VE3 */
+            s_data.fuelTbl   = (fresh && stSeen) ? ((s_outpc[80] & 0x20) ? 3 : 1) : 0;
+            s_data.revLimOn  = (fresh && stSeen) && (s_outpc[82] & 0x20);
+            s_data.probePolls = s_portsPollSeen;
+            s_data.probeResp  = s_portsRespSent;
+            s_data.probeReqId = s_portsPollId;
+            s_data.probeRspId = s_rspId;
+
+            /* PROBE: print ECU broadcast status1 bit transitions — bit5 ftblsw
+             * (fuel table switch, the TRUTH for VE) and bit6 stblsw (spark). */
+            static uint8_t s_lastSt1 = 0xFF;
+            if (fresh && stSeen && s_outpc[80] != s_lastSt1) {
+                s_lastSt1 = s_outpc[80];
+                printf("[CAN] status1=0x%02X ftblsw=%d stblsw=%d\n", s_outpc[80],
+                       (s_outpc[80] & 0x20) ? 1 : 0, (s_outpc[80] & 0x40) ? 1 : 0);
+            }
+
+            bool advSeen = s_seen[1];
+            s_data.sparkAdv10 = (fresh && advSeen) ? rdS16(8) : INT32_MIN;   /* INT32_MIN = stale */
+
+            /* gp17 [0-1] = outpc.boost_targ, S16 kPa x0.1 (absolute). Firmware only
+             * writes it inside the closed-loop branch -> reads 0 while tune is
+             * open-loop, so the marker stays off until the user flips to CL. */
+            bool tgSeen = s_seen[17];
+            s_data.bstTargKpa = (fresh && tgSeen) ? (rdS16(136) / 10) : 0;
 
             s_data.canOk = fresh || sdbFresh;
             s_data.sdbOk = sdbFresh;
-            s_data.rpm    = (uint16_t)maPush(s_maRpm, rawRpm);
-            s_data.map    = (int16_t)maPush(s_maMap, rawMap);
-            s_data.clt    = (int16_t)maPush(s_maClt, rawClt);
-            s_data.mat    = (int16_t)maPush(s_maMat, rawMat);
-            s_data.tps    = (int16_t)maPush(s_maTps, rawTps);
-            s_data.batt   = (int16_t)maPush(s_maBatt, rawBatt);
-            s_data.afr    = (int16_t)maPush(s_maAfr, rawAfr);
+            s_data.rpm    = (uint16_t)maPush(&s_maRpm, rawRpm);
+            s_data.map    = (int16_t)maPush(&s_maMap, rawMap);
+            s_data.clt    = (int16_t)maPush(&s_maClt, rawClt);
+            s_data.mat    = (int16_t)maPush(&s_maMat, rawMat);
+            s_data.tps    = (int16_t)maPush(&s_maTps, rawTps);
+            s_data.batt   = (int16_t)maPush(&s_maBatt, rawBatt);
+            s_data.afr    = (int16_t)maPush(&s_maAfr, rawAfr);
             s_data.iacstep = rawIac;
             s_data.baro   = rawBaro;
             s_data.warnFlags = dashFresh ? s_dashB3 : 0;
@@ -205,7 +322,6 @@ static void can_rx_task(void *arg)
             s_data.fanMode   = dashFresh ? can_rx_get_fan_mode()   : 0xFF;
             s_data.iacMode   = dashFresh ? can_rx_get_iac_mode()   : 0xFF;
             s_data.buzzerOn  = dashFresh && can_rx_get_buzzer_on();
-            s_data.bootTestOn = dashFresh && can_rx_get_boot_test();
             s_data.speedMph  = can_rx_get_speed();
             s_data.lastRxMs = s_lastRxMs;
             s_data.lastSdbMs = s_lastSdbMs;
@@ -233,15 +349,13 @@ esp_err_t can_rx_init(void)
     memset(s_seen, 0, sizeof(s_seen));
     memset(s_sdb, 0, sizeof(s_sdb));
     memset(s_sdbSeen, 0, sizeof(s_sdbSeen));
-    memset(s_maRpm, 0, sizeof(s_maRpm));
-    memset(s_maMap, 0, sizeof(s_maMap));
-    memset(s_maClt, 0, sizeof(s_maClt));
-    memset(s_maMat, 0, sizeof(s_maMat));
-    memset(s_maTps, 0, sizeof(s_maTps));
-    memset(s_maBatt, 0, sizeof(s_maBatt));
-    memset(s_maAfr, 0, sizeof(s_maAfr));
-    s_maIdx = 0;
-    s_maCount = 0;
+    memset(&s_maRpm, 0, sizeof(s_maRpm));
+    memset(&s_maMap, 0, sizeof(s_maMap));
+    memset(&s_maClt, 0, sizeof(s_maClt));
+    memset(&s_maMat, 0, sizeof(s_maMat));
+    memset(&s_maTps, 0, sizeof(s_maTps));
+    memset(&s_maBatt, 0, sizeof(s_maBatt));
+    memset(&s_maAfr, 0, sizeof(s_maAfr));
 
     const twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
@@ -318,7 +432,7 @@ esp_err_t can_rx_get_link_payload(uint8_t outpc[72], uint16_t *mask)
     if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    memcpy(outpc, s_outpc, sizeof(s_outpc));
+    memcpy(outpc, s_outpc, CAN_GROUPS * 8);   /* link stays 72B — iobox3 protocol unchanged */
     uint16_t m = 0;
     for (uint8_t i = 0; i < CAN_GROUPS; i++) {
         if (s_seen[i]) m |= (uint16_t)(1u << i);
@@ -369,7 +483,6 @@ uint16_t can_rx_get_a4mv(void)    { return s_a4mv; }
 static volatile uint8_t s_fanMode = 0;
 static volatile uint8_t s_iacMode = 0;
 static volatile uint8_t s_buzzerOn = 0;
-static volatile uint8_t s_bootTestOn = 0;
 
 void can_rx_set_fan_mode(uint8_t mode)    { s_fanMode = mode; }
 uint8_t can_rx_get_fan_mode(void)        { return s_fanMode; }
@@ -377,8 +490,6 @@ void can_rx_set_iac_mode(uint8_t mode)    { s_iacMode = mode; }
 uint8_t can_rx_get_iac_mode(void)        { return s_iacMode; }
 void can_rx_set_buzzer_on(uint8_t on)     { s_buzzerOn = on; }
 uint8_t can_rx_get_buzzer_on(void)       { return s_buzzerOn; }
-void can_rx_set_boot_test(uint8_t on)     { s_bootTestOn = on; }
-uint8_t can_rx_get_boot_test(void)       { return s_bootTestOn; }
 
 /* Speed mph from B0 v5 telemetry byte [2]. 255 = no telemetry seen yet. */
 static volatile uint8_t s_speedMph = 255;
