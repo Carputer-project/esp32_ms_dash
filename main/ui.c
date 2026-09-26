@@ -453,17 +453,19 @@ static void gauge_paint_classic(lv_obj_t *parent) {
     /* dial arc rail */
     face_arc(&layer, ox, oy, (int)(r * 0.72f), GAUGE_A0, GAUGE_A1, COL_TICK, 3, LV_OPA_80);
 
-    /* redline band */
-    if (RPM_REDLINE > RPM_MIN) {
-        float rpct = gauge_pct_rpm(RPM_REDLINE);
+    /* redline band — follows the live shift setting (s_shift_rpm_cfg), same
+     * source as the OEM face / strip / ring / OVERREV banner */
+    int32_t red_rpm = s_shift_rpm_cfg;
+    if (red_rpm > RPM_MIN) {
+        float rpct = gauge_pct_rpm(red_rpm);
         float a0 = gauge_angle(rpct);
         face_arc(&layer, ox, oy, (int)(r * 0.83f), a0, GAUGE_A1, COL_BAD, (int)(r * 0.14f), LV_OPA_60);
     }
 
-    /* amber warn zone */
-    if (RPM_REDLINE > RPM_MIN) {
-        float rpct = gauge_pct_rpm(RPM_REDLINE);
-        float w0 = gauge_pct_rpm(RPM_REDLINE - 1000);
+    /* amber warn zone just below redline */
+    if (red_rpm > RPM_MIN) {
+        float rpct = gauge_pct_rpm(red_rpm);
+        float w0 = gauge_pct_rpm(red_rpm - SHIFT_START_GAP);
         if (w0 < 0) w0 = 0;
         face_arc(&layer, ox, oy, (int)(r * 0.76f), gauge_angle(w0), gauge_angle(rpct),
                  COL_WARN, (int)(r * 0.09f), LV_OPA_50);
@@ -600,17 +602,18 @@ static void gauge_paint_needle(lv_obj_t *parent) {
     /* arc rail the needle rides on (accent) */
     face_arc(&layer, ox, oy, (int)(r * 0.60f), GAUGE_A0, GAUGE_A1, face_colour(FACE_NEEDLE), 2, LV_OPA_80);
 
-    /* thin redline band at the tail of the sweep */
-    if (RPM_REDLINE > RPM_MIN) {
-        float rpct = gauge_pct_rpm(RPM_REDLINE);
+    /* thin redline band at the tail of the sweep — live shift setting */
+    int32_t red_rpm = s_shift_rpm_cfg;
+    if (red_rpm > RPM_MIN) {
+        float rpct = gauge_pct_rpm(red_rpm);
         face_arc(&layer, ox, oy, (int)(r * 0.60f), gauge_angle(rpct), GAUGE_A1,
                  COL_BAD, (int)(r * 0.10f), LV_OPA_60);
     }
 
     /* amber warn zone just below redline */
-    if (RPM_REDLINE > RPM_MIN) {
-        float rpct = gauge_pct_rpm(RPM_REDLINE);
-        float w0 = gauge_pct_rpm(RPM_REDLINE - 1000);
+    if (red_rpm > RPM_MIN) {
+        float rpct = gauge_pct_rpm(red_rpm);
+        float w0 = gauge_pct_rpm(red_rpm - SHIFT_START_GAP);
         if (w0 < 0) w0 = 0;
         face_arc(&layer, ox, oy, (int)(r * 0.60f), gauge_angle(w0), gauge_angle(rpct),
                  COL_WARN, (int)(r * 0.12f), LV_OPA_40);
@@ -700,6 +703,11 @@ static void ui_theme_apply(void) {
         if (static_bars[i][0]) lv_obj_set_style_bg_color(static_bars[i][0], lv_color_hex(bar_col), 0);
         if (static_bars[i][1]) lv_obj_set_style_text_color(static_bars[i][1], lv_color_hex(bar_col), 0);
     }
+    /* Theme change must also reach the highlight buttons (FAN row, LAUNCH,
+     * TABLE) — their own updaters key on state change or accent_live() and
+     * would otherwise keep the previous theme's colour. */
+    update_fan_mode_buttons(can_rx_get_fan_mode());
+    update_launch_table();
     if (s_face_active == FACE_NEEDLE) {
         if (s_needle) lv_obj_set_style_line_color(s_needle, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
         if (s_needle_hub) lv_obj_set_style_bg_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
@@ -1510,14 +1518,18 @@ static void update_launch_table(void) {
     if (!s_main_launch || !s_main_table) return;
     bool l_on = s_launch_armed && s_can_ok;
     bool t_on = s_table_on && s_can_ok;
-    /* Re-style only on an actual change (called every frame). */
+    /* Re-style on an actual change (called every frame) OR when the accent
+     * changes (theme swatch / night toggle) — the old diff-guard cached the
+     * rendered colour, so accent changes never reached these buttons. */
     static bool s_last_l = false, s_last_t = false;
-    if (l_on == s_last_l && t_on == s_last_t) return;
-    s_last_l = l_on; s_last_t = t_on;
+    static uint32_t s_last_acc = 0;
+    uint32_t acc = accent_live();
+    if (l_on == s_last_l && t_on == s_last_t && acc == s_last_acc) return;
+    s_last_l = l_on; s_last_t = t_on; s_last_acc = acc;
     lv_obj_set_style_bg_opa(s_main_launch, l_on ? LV_OPA_100 : LV_OPA_50, 0);
-    lv_obj_set_style_bg_color(s_main_launch, lv_color_hex(l_on ? accent_live() : 0x2A2A3A), 0);
+    lv_obj_set_style_bg_color(s_main_launch, lv_color_hex(l_on ? acc : 0x2A2A3A), 0);
     lv_obj_set_style_bg_opa(s_main_table, t_on ? LV_OPA_100 : LV_OPA_50, 0);
-    lv_obj_set_style_bg_color(s_main_table, lv_color_hex(t_on ? accent_live() : 0x2A2A3A), 0);
+    lv_obj_set_style_bg_color(s_main_table, lv_color_hex(t_on ? acc : 0x2A2A3A), 0);
 }
 
 static void launch_evt(lv_event_t *e) {
@@ -1552,7 +1564,7 @@ static bool     s_buzz_on        = false;
 static int16_t  s_iac_target_val = 900;    /* rpm */
 static lv_obj_t *s_shift_val_lbl, *s_duty_val_lbl, *s_buzz_lbl;
 static lv_obj_t *s_buzz_btn;
-static lv_obj_t *s_gas_lbl, *s_gdamp_val_lbl, *s_glow_val_lbl;
+static lv_obj_t *s_gas_set_lbl, *s_gdamp_val_lbl, *s_glow_val_lbl;
 static lv_timer_t *s_gas_timer;
 static int16_t s_gdamp_val = 0;   /* mirror of box gasDamp */
 static int16_t s_glow_val  = 20;  /* mirror of box lowFuelPct */
@@ -1626,7 +1638,7 @@ static void scr_set_delete_evt(lv_event_t *e) {
     s_buzz_lbl = NULL;
     s_shift_val_lbl = NULL; s_duty_val_lbl = NULL;
     s_gdamp_val_lbl = NULL; s_glow_val_lbl = NULL;
-    s_gas_lbl = NULL;
+    s_gas_set_lbl = NULL;
     s_tgt_val_lbl = NULL;
     for (int i = 0; i < THEME_COUNT; i++) s_btn_theme[i] = NULL;
     for (int i = 0; i < FACE_COUNT; i++) { s_btn_face[i] = NULL; s_face_lbl[i] = NULL; }
@@ -1766,7 +1778,7 @@ static void settings_glow_evt(lv_event_t *e) {
 
 static void gas_timer_cb(lv_timer_t *t) {
     (void)t;
-    if (!s_gas_lbl) return;
+    if (!s_gas_set_lbl) return;
     uint8_t g = can_rx_get_gas();
     uint16_t mv = can_rx_get_a4mv();
     char buf[28];
@@ -1776,7 +1788,7 @@ static void gas_timer_cb(lv_timer_t *t) {
         lv_snprintf(buf, sizeof(buf), "GAS %u%%", g);
     else
         lv_snprintf(buf, sizeof(buf), "GAS --%%");
-    lv_label_set_text(s_gas_lbl, buf);
+    lv_label_set_text(s_gas_set_lbl, buf);
 }
 
 static void settings_iac_target_step(int16_t d) {
@@ -2105,10 +2117,10 @@ static void build_settings(void) {
     lv_obj_set_style_text_color(lbl, lv_color_hex(COL_DIM), 0);
     lv_obj_set_pos(lbl, rx, 360);
 
-    s_gas_lbl = lv_label_create(s_scr_set);
-    lv_label_set_text(s_gas_lbl, "GAS --%");
-    lv_obj_set_style_text_color(s_gas_lbl, lv_color_hex(COL_TEXT), 0);
-    lv_obj_set_pos(s_gas_lbl, rx + 130, 360);
+    s_gas_set_lbl = lv_label_create(s_scr_set);
+    lv_label_set_text(s_gas_set_lbl, "GAS --%");
+    lv_obj_set_style_text_color(s_gas_set_lbl, lv_color_hex(COL_TEXT), 0);
+    lv_obj_set_pos(s_gas_set_lbl, rx + 130, 360);
     s_gas_timer = lv_timer_create(gas_timer_cb, 500, NULL);
 
     /* Gas-cal SET buttons removed 2026-09-21 — calibration is box-serial only. */
