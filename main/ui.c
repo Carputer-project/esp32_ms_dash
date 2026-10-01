@@ -66,9 +66,55 @@ static bool s_face_dirty = false;   /* face changed; ui_face_persist_once() writ
 /* Per-face colour state: -1 = OFF (excluded from tap cycle, kept dormant),
  * 0 = AUTO (follow global accent), 1..THEME_COUNT = fixed theme colour. */
 static int8_t s_face_state[FACE_COUNT] = { 0, 0, 0 };
-/* Canvas buffer pointers — stored so we can free the original allocation
- * (LVGL may align the pointer passed to lv_canvas_set_buffer). */
+/* Canvas buffer pointers — stored so we can free the original allocation.
+ * Note: the justification once recorded here ("LVGL may align the pointer
+ * passed to lv_canvas_set_buffer") was checked against the vendored LVGL 9 and
+ * is FALSE — lv_canvas.c passes `buf` verbatim to lv_draw_buf_init() with no
+ * alignment applied. Holding the original pointer is still the right thing to
+ * do (it makes ownership explicit and does not depend on LVGL internals), but
+ * do not "simplify" this back to lv_canvas_get_draw_buf(...)->data. Verified
+ * in IDF that free() == heap_caps_free(), so freeing a MALLOC_CAP_SPIRAM
+ * pointer here is correct, and LVGL never frees a canvas buffer itself. */
 static void *s_face_buf[FACE_COUNT] = { NULL };
+/* Dial scale labels, one set of 9 per face. Created once on the main screen
+ * (they sit at absolute screen coordinates and do not move with the canvas) and
+ * reused across repaints. Previously created as children of the carrier on
+ * every face_paint() and never deleted — 9 leaked labels per repaint. */
+static lv_obj_t *s_face_scale_labels[FACE_COUNT][9];
+
+/* Dial scale labels now live on the main screen, so only the ACTIVE face's set
+ * may be visible -- the canvas underneath does not cover them. Hide the other
+ * two sets whenever the active face changes or a face is (re)painted. */
+static void face_scale_labels_visible(int active) {
+    for (int f = 0; f < FACE_COUNT; f++) {
+        for (int i = 0; i < 9; i++) {
+            lv_obj_t *l = s_face_scale_labels[f][i];
+            if (!l) continue;
+            if (f == active) lv_obj_remove_flag(l, LV_OBJ_FLAG_HIDDEN);
+            else            lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+/* Fetch (or create once) one of a face's 9 dial scale labels. Labels are parented
+ * to the main screen, not the carrier, because their coordinates are absolute
+ * screen positions — they do not follow the canvas. Keeping them across repaints
+ * is what stops the leak; caller sets text/pos. */
+static lv_obj_t *scale_label(int face, int i, const char *txt, uint32_t colour) {
+    if (face < 0 || face >= FACE_COUNT || i < 0 || i >= 9) return NULL;
+    lv_obj_t *l = s_face_scale_labels[face][i];
+    if (!l) {
+        l = lv_label_create(s_scr_main);
+        if (!l) return NULL;
+        s_face_scale_labels[face][i] = l;
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+        lv_obj_set_width(l, 28);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    }
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_hex(colour), 0);
+    return l;
+}
 static const char *s_face_names[FACE_COUNT] = { "CLS", "OEM", "NDL" };
 
 /* needle-pointer geometry (FACE_NEEDLE only): a line from ~0.1R behind the hub
@@ -511,13 +557,8 @@ static void gauge_paint_classic(lv_obj_t *parent) {
         float rad = DEG2RAD(a);
         int lx = (int)(ox + lr * cosf(rad));
         int ly = (int)(oy + lr * sinf(rad));
-        lv_obj_t *l = lv_label_create(parent);
-        lv_label_set_text(l, scale_txt[i]);
-        lv_obj_set_style_text_color(l, lv_color_hex(COL_DIM), 0);
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
-        lv_obj_set_width(l, 28);
-        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_pos(l, (cx - sz / 2) + lx - 14, (cy - sz / 2) + ly - 8);
+        lv_obj_t *l = scale_label(FACE_CLASSIC, i, scale_txt[i], COL_DIM);
+        if (l) lv_obj_set_pos(l, (cx - sz / 2) + lx - 14, (cy - sz / 2) + ly - 8);
     }
 
     lv_canvas_finish_layer(canvas, &layer);
@@ -583,13 +624,8 @@ static void gauge_paint_oem(lv_obj_t *parent) {
         float rad = DEG2RAD(a);
         int lx = (int)(ox + lr * cosf(rad));
         int ly = (int)(oy + lr * sinf(rad));
-        lv_obj_t *l = lv_label_create(parent);
-        lv_label_set_text(l, scale_txt[i]);
-        lv_obj_set_style_text_color(l, lv_color_hex(0xD8D8E0), 0);
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
-        lv_obj_set_width(l, 28);
-        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_pos(l, (cx - sz / 2) + lx - 14, (cy - sz / 2) + ly - 8);
+        lv_obj_t *l = scale_label(FACE_OEM, i, scale_txt[i], 0xD8D8E0);
+        if (l) lv_obj_set_pos(l, (cx - sz / 2) + lx - 14, (cy - sz / 2) + ly - 8);
     }
 
     lv_canvas_finish_layer(canvas, &layer);
@@ -661,13 +697,8 @@ static void gauge_paint_needle(lv_obj_t *parent) {
         float rad = DEG2RAD(a);
         int lx = (int)(ox + lr * cosf(rad));
         int ly = (int)(oy + lr * sinf(rad));
-        lv_obj_t *l = lv_label_create(parent);
-        lv_label_set_text(l, scale_txt[i]);
-        lv_obj_set_style_text_color(l, lv_color_hex(COL_DIM), 0);
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
-        lv_obj_set_width(l, 28);
-        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_pos(l, (cx - sz / 2) + lx - 14, (cy - sz / 2) + ly - 8);
+        lv_obj_t *l = scale_label(FACE_NEEDLE, i, scale_txt[i], COL_DIM);
+        if (l) lv_obj_set_pos(l, (cx - sz / 2) + lx - 14, (cy - sz / 2) + ly - 8);
     }
 
     lv_canvas_finish_layer(canvas, &layer);
@@ -700,8 +731,21 @@ static void face_paint(int f, bool force) {
     if (f == FACE_CLASSIC) gauge_paint_classic(*carrier);
     else if (f == FACE_OEM) gauge_paint_oem(*carrier);
     else gauge_paint_needle(*carrier);
+
+    /* Only mark the face clean if the repaint actually produced a canvas.
+     * Each gauge_paint_* returns early when its 304 KB PSRAM malloc fails, and
+     * that happens AFTER face_canvas_del() has already destroyed the previous
+     * canvas. Recording the colour anyway meant s_face_baked[] said "clean"
+     * with no canvas behind it, so every later face_paint(f, false) was a
+     * no-op and the dial stayed blank until a forced repaint. */
+    if (!s_face_buf[f]) return;
+
     s_face_baked[f] = want;
-    s_face_dirty = true;
+    /* NOTE: no s_face_dirty here. face_paint() is a pure repaint -- it changes
+     * no persistable value. Setting the flag forced a 6-key NVS commit that
+     * rewrote byte-identical data on every accent/night/face-colour tap. The
+     * dirty flag belongs only where face or face_state actually changes. */
+    face_scale_labels_visible(f);
 }
 
 /* Re-paint the active gauge face after an accent/fixed-colour/night change.
@@ -1460,6 +1504,8 @@ static void face_toggle_evt(lv_event_t *e) {
                 lv_obj_clear_flag(faces[s_face_active], LV_OBJ_FLAG_HIDDEN);
             /* Repaint the now-shown face if its colour is stale (fixed colour
              * changed while hidden), plus restyle the needle for the new face. */
+            /* Scale labels are on the main screen, so swap their visibility too. */
+            face_scale_labels_visible(s_face_active);
             face_paint(s_face_active, false);
             if (s_face_active == FACE_NEEDLE && s_needle) {
                 lv_obj_set_style_line_color(s_needle, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
@@ -1467,12 +1513,16 @@ static void face_toggle_evt(lv_event_t *e) {
                 lv_obj_set_style_border_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
             }
             ui_face_apply_live();
+            /* Only flag the persist when the ACTIVE face actually changed.
+             * This used to be set unconditionally on every tap, so tapping the
+             * dial when only one face is enabled (or landing back on the same
+             * face) still queued a full NVS commit rewriting identical bytes. */
+            s_face_dirty = true;
         }
     }
     /* Do NOT flash-write from this LVGL event handler — the NVS commit's
      * cache-freeze path overflows the LVGL task stack (assert). Just flag it;
      * a dedicated task (ui_face_persist_once) does the actual NVS write. */
-    s_face_dirty = true;
 }
 
 /* Called from a dedicated (non-LVGL) task so the NVS flash commit runs on a
@@ -1680,9 +1730,13 @@ static void settings_nvs_load(void) {
         if (nvs_get_i32(h, "night", &v) == ESP_OK && v >= 0 && v <= 1)
             s_night = (v == 1);
         /* Settings baselines (dash-owned, resend on link-up) */
-        if (nvs_get_i32(h, "gdamp", &v) == ESP_OK && v >= 0 && v <= 255)
+        /* Validate against the SAME domain the steppers enforce, not a wider
+         * one: settings_gdamp_evt clamps to 0..15 and settings_glow_evt to
+         * 5..90. Loading 0..255 would adopt a value the UI cannot produce, and
+         * glow=0 makes every non-empty tank read as low fuel in ui_update. */
+        if (nvs_get_i32(h, "gdamp", &v) == ESP_OK && v >= 0 && v <= 15)
             s_gdamp_val = (int16_t)v;
-        if (nvs_get_i32(h, "glow", &v) == ESP_OK && v >= 0 && v <= 100)
+        if (nvs_get_i32(h, "glow", &v) == ESP_OK && v >= 5 && v <= 90)
             s_glow_val = (int16_t)v;
         if (nvs_get_i32(h, "iac_target", &v) == ESP_OK && v >= 500 && v <= 3000)
             s_iac_target_val = (int16_t)v;
@@ -1690,9 +1744,30 @@ static void settings_nvs_load(void) {
     }
 }
 
+/* BACK: switch to main and tear the settings screen down ourselves.
+ *
+ * Was lv_scr_load_anim(s_scr_main, FADE_IN, 300, 0, auto_del=true).
+ * That is unsafe here. With auto_del the delete happens at the END of the
+ * fade, so for 300 ms the display holds prev_scr = s_scr_set with del_prev
+ * pending. For FADE_IN, is_out_anim() is false, so only act_scr is drawn and
+ * hit-tested -- the main screen is fully live and tappable the whole time.
+ * Tapping SETTINGS in that window runs ui_show_settings(), which sees a
+ * non-NULL s_scr_set, skips build_settings(), then calls lv_scr_load() on it.
+ * That load hits lv_display.c's `if (d->prev_scr && d->del_prev)
+ * lv_obj_delete(d->prev_scr)` -- which frees s_scr_set -- and then immediately
+ * dereferences the freed screen to load it. No LV_ASSERT_OBJ guards it
+ * (LV_USE_ASSERT_MISC is off), so obj->parent is read from a recycled heap
+ * block and the walk continues into garbage. Hard fault.
+ *
+ * Doing a non-animated load and deleting explicitly avoids prev_scr/del_prev
+ * entirely, so the screen cannot be freed out from under a load in flight. */
 static void settings_back_evt(lv_event_t *e) {
     (void)e;
-    lv_scr_load_anim(s_scr_main, LV_SCR_LOAD_ANIM_FADE_IN, 300, 0, true);
+    lv_scr_load(s_scr_main);
+    if (s_scr_set) {
+        lv_obj_del(s_scr_set);   /* fires scr_set_delete_evt -> clears all child ptrs */
+        s_scr_set = NULL;        /* defensive; handler already does this */
+    }
 }
 
 /* auto_del on the back animation frees the settings screen (and all its child
@@ -1884,6 +1959,18 @@ static void settings_shift_step(int16_t d) {
     if (s_shift_rpm_val > 9000) s_shift_rpm_val = 9000;
     s_shift_rpm_cfg = s_shift_rpm_val;      /* drive the on-screen strip too */
     s_shift_dirty = true;                   /* NVS write deferred to ui_persist_task */
+    /* Re-bake the dial: the redline/warn-zone arcs are painted INTO the canvas
+     * from s_shift_rpm_cfg at build time, so without invalidating the baked
+     * cache the strip and the live lv_arc ring would move to the new shift
+     * point while the painted redline band stayed where it was. The comment at
+     * ui_theme_apply() claims the zones "reshape the ring without a rebuild" --
+     * true for the arcs, not for the canvas. */
+    s_face_baked[s_face_active] = 0xFFFFFFFF;
+    /* Defer the repaint: this runs inside an LVGL event handler, and the paint
+     * does a 304 KB free + realloc + 136900-iteration blit under the lock. Mark
+     * the theme dirty instead so ui_update() does it once on its own schedule,
+     * exactly like the accent and NIGHT changes at :1812 / :1820. */
+    s_theme_apply_pending = true;
     /* Shift point no longer sent to the box: 'S' forces O1 into shift-light
      * mode (OM_RPM), which would sabotage the table-switch pin. The dash
      * shift strip runs fully local off s_shift_rpm_cfg. */
@@ -2285,6 +2372,10 @@ static void build_settings(void) {
 
 void ui_show_settings(void) {
     if (!s_scr_set) build_settings();
+    /* Defensive: never load a screen we have already deleted. settings_back_evt
+     * deletes s_scr_set after loading main, so a stale pointer here would be a
+     * load of freed memory. build_settings() recreates it if NULL. */
+    if (!s_scr_set) return;
     lv_scr_load(s_scr_set);
     /* Apply current mode highlights on page show */
     update_fan_mode_buttons(s_prev.fanMode);
@@ -2337,16 +2428,30 @@ static void update_buzzer_button(bool on) {
 }
 
 void ui_update(const dash_data_t *d) {
-    /* Detect CAN task death: if lastRxMs is stale (>2s), force canOk=false
-     * so UI shows CAN LOST instead of frozen data. */
+    /* CAN task liveness must consider BOTH receive paths. The primary outpc
+     * stream (0x5F0+) and the small-data-block fallback (0x5E8+) have
+     * independent freshness windows in can_rx.c, and d->canOk already ORs
+     * them. Gating only on lastRxMs meant that once the primary stream went
+     * quiet -- which is precisely what entering SDB fallback means -- the UI
+     * still declared CAN LOST 2 s later no matter how healthy SDB was, so the
+     * whole fallback path could never actually keep the cluster alive.
+     * Use whichever stream updated most recently. */
     uint32_t now_ms = esp_timer_get_time() / 1000;
-    bool can_task_alive = (now_ms - d->lastRxMs) < 2000;
+    uint32_t last_any = (d->lastRxMs > d->lastSdbMs) ? d->lastRxMs : d->lastSdbMs;
+    bool can_task_alive = (now_ms - last_any) < 2000;
     bool ok = d->canOk && can_task_alive;
     char buf[32];
 
     lv_obj_set_style_text_color(s_can_lbl, lv_color_hex(ok ? COL_GOOD : COL_BAD), 0);
-    if (ok != s_prev.canOk)
+    /* Guard on the value actually rendered, not s_prev.canOk. Those differ:
+     * ok also folds in can_task_alive, so in the SDB-fallback state the old
+     * guard was permanently true and lv_label_set_text ran ~30x/s forever,
+     * each call doing an lv_free + lv_malloc + full text redraw. */
+    static bool s_last_can_ok = true;
+    if (ok != s_last_can_ok) {
+        s_last_can_ok = ok;
         lv_label_set_text(s_can_lbl, ok ? "CAN OK" : "CAN LOST");
+    }
 
     /* BOX chip: ESP-NOW link to iobox3 alive (redraw only on transition) */
     if (d->ioboxOk != s_prev.ioboxOk) {
