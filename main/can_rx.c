@@ -23,7 +23,6 @@ static const char *TAG = "CAN";
 static dash_data_t s_data;
 static can_stats_t s_stats;
 static SemaphoreHandle_t s_data_mutex;
-static SemaphoreHandle_t s_stats_mutex;
 
 static uint8_t  s_outpc[CAN_RX_GROUPS * 8];
 static bool     s_seen[CAN_RX_GROUPS];
@@ -36,13 +35,12 @@ static uint8_t  s_dashB0 = 0;
 static uint8_t  s_dashB3 = 0;
 static bool     s_dashSeen = false;
 
-/* ---- CAN Remote Port probe (2026-09-24, temporary) ----
- * Logs unseen extended frames, answers the ECU's MS2/Extra CAN-poll ports
- * request (MSG_REQ) with a MSG_RSP "push" of 2 bytes into outpc gpioport[1..2]
- * (Remote Port 3 = gpioport[2]), and prints the ECU's own fuel-switch status
- * bit (status1 bit5 ftblsw) transitions as the acceptance proof.
- * s_remotePorts: bit1 SET = VE1 / CLEARED = VE3; bit0 SET = launch released /
- * CLEARED = launch active (active-low, mirrors a pulled-up physical input). */
+/* ---- CAN Remote Port responder (2026-09-24) ----
+ * Answers the ECU's MS2/Extra CAN-poll ports request (MSG_REQ) with a MSG_RSP
+ * pushing 2 bytes into outpc gpioport[1..2] (Remote Port 3 = gpioport[2]).
+ * Dash buttons drive the responder byte: bit1 CLEARED = VE3 table switch,
+ * bit0 CLEARED = launch active (active-low, mirrors pulled-up physical input).
+ * ECU polls every 10ms; launch indicator requires fresh polls (<100ms). */
 #define PROBE_MSG_RSP 2u
 static volatile uint8_t s_remotePorts = 0x03u;   /* default: VE1 + launch released */
 static uint32_t s_extFrames      = 0;
@@ -50,6 +48,7 @@ static uint32_t s_portsPollSeen  = 0;
 static uint32_t s_portsRespSent  = 0;
 static uint32_t s_portsPollId    = 0;      /* wire ID of the ECU's ports poll */
 static uint32_t s_rspId          = 0;      /* wire ID we transmit back */
+static uint32_t s_lastPortsPollMs = 0;     /* when ECU last polled Remote Port 3 */
 static uint32_t s_extSeen[8];
 static uint32_t s_extCnt[8];
 static uint8_t  s_extSeenN = 0;
@@ -132,16 +131,14 @@ static void can_rx_task(void *arg)
         if (twai_receive(&msg, pdMS_TO_TICKS(10)) == ESP_OK) {
             s_stats.total_frames++;
 
-            if (msg.identifier == CAN_DASH_ID) {
+            if (!msg.extd && msg.identifier == CAN_DASH_ID) {
                 uint8_t dlc = msg.data_length_code > 8 ? 8 : msg.data_length_code;
                 if (dlc >= 1) s_dashB0 = msg.data[0];
                 if (dlc >= 4) s_dashB3 = msg.data[3];
                 s_dashSeen = true;
                 s_lastDashMs = esp_timer_get_time() / 1000;
-                continue;
             }
-
-            if (msg.identifier >= CAN_SDB_ID && msg.identifier < CAN_SDB_ID + CAN_SDB_MSGS) {
+            else if (!msg.extd && msg.identifier >= CAN_SDB_ID && msg.identifier < CAN_SDB_ID + CAN_SDB_MSGS) {
                 uint8_t grp = (uint8_t)(msg.identifier - CAN_SDB_ID);
                 uint8_t dlc = msg.data_length_code > 8 ? 8 : msg.data_length_code;
                 if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -151,10 +148,8 @@ static void can_rx_task(void *arg)
                     xSemaphoreGive(s_data_mutex);
                 }
                 s_lastSdbMs = esp_timer_get_time() / 1000;
-                continue;
             }
-
-            if (msg.identifier >= CAN_BASE_ID && msg.identifier < CAN_BASE_ID + CAN_RX_GROUPS) {
+            else if (!msg.extd && msg.identifier >= CAN_BASE_ID && msg.identifier < CAN_BASE_ID + CAN_RX_GROUPS) {
                 uint8_t grp = (uint8_t)(msg.identifier - CAN_BASE_ID);
                 uint8_t dlc = msg.data_length_code > 8 ? 8 : msg.data_length_code;
                 if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -164,7 +159,6 @@ static void can_rx_task(void *arg)
                     xSemaphoreGive(s_data_mutex);
                 }
                 s_lastRxMs = esp_timer_get_time() / 1000;
-
             }
 
             /* ---- PROBE: extended frames (ECU CAN polls + anything else) ---- */
@@ -185,31 +179,29 @@ static void can_rx_task(void *arg)
                 }
 
                 /* MS2/Extra ports poll request: MSG_REQ, reply-to table 7, 2 bytes
-                 * requested (ADC polls request 8 bytes -> excluded by mask). */
+                 * requested (ADC polls request 8 bytes -> excluded by mask).
+                 * Only answer the Remote Port 3 poll (var_off == 167 = gpioport[2]). */
                 if (msg.data_length_code >= 3 && msg.data[0] == 7 && (msg.data[2] & 0x1F) == 2) {
-                    s_portsPollSeen++;
-                    if (s_portsPollId == 0) s_portsPollId = msg.identifier;
-                    /* payload: {rem_table=7, rem_off>>3, ((rem_off&7)<<5)|2} */
                     uint32_t var_off = ((uint32_t)msg.data[1] << 3) | (msg.data[2] >> 5);
-                    /* Response wire ID, built from the ECU's own ISR/acceptance
-                     * decode (verified 2026-09-24 against observed poll 0x13082B8:
-                     * var_off=ID[28:18], msg_type=ID[17:15], From=ID[14:11],
-                     * To=ID[10:7] (must = CANid 0 for bank-1 accept), var_blk 7
-                     * = 0b0111000 at ID[6:0] -> 0x38). SRR/IDE are inserted by
-                     * the controller automatically for extended frames. */
-                    uint32_t rsp_id = (var_off & 0x7FFu) << 18;      /* ID[28:18] = 167 */
-                    rsp_id |= ((uint32_t)PROBE_MSG_RSP & 0x7u) << 15; /* ID[17:15] = 2 */
-                    rsp_id |= 5u << 11;                               /* ID[14:11] = From = CANid 5 (tune can_poll_id) */
-                    rsp_id |= 0x38u;                                 /* ID[6:0] = var_blk 7 */
-                    twai_message_t rsp = {0};
-                    rsp.identifier = rsp_id;
-                    rsp.extd = true;
-                    rsp.data_length_code = 2;
-                    rsp.data[0] = 0x00;                        /* gpioport[1] unused */
-                    rsp.data[1] = (uint8_t)s_remotePorts;      /* gpioport[2] = Remote Port3 */
-                    if (twai_transmit(&rsp, pdMS_TO_TICKS(10)) == ESP_OK) {
-                        s_portsRespSent++;
-                        s_rspId = rsp_id;
+                    if (var_off == 167) {  /* Remote Port 3 = gpioport[2] */
+                        s_portsPollSeen++;
+                        s_lastPortsPollMs = esp_timer_get_time() / 1000;
+                        if (s_portsPollId == 0) s_portsPollId = msg.identifier;
+                        /* Response wire ID: var_off=ID[28:18], msg_type=2, From=5, var_blk=7 */
+                        uint32_t rsp_id = (var_off & 0x7FFu) << 18;
+                        rsp_id |= ((uint32_t)PROBE_MSG_RSP & 0x7u) << 15;
+                        rsp_id |= 5u << 11;
+                        rsp_id |= 0x38u;
+                        twai_message_t rsp = {0};
+                        rsp.identifier = rsp_id;
+                        rsp.extd = true;
+                        rsp.data_length_code = 2;
+                        rsp.data[0] = 0x00;                   /* gpioport[1] unused */
+                        rsp.data[1] = (uint8_t)s_remotePorts; /* gpioport[2] = Remote Port3 */
+                        if (twai_transmit(&rsp, pdMS_TO_TICKS(10)) == ESP_OK) {
+                            s_portsRespSent++;
+                            s_rspId = rsp_id;
+                        }
                     }
                 }
             }
@@ -278,6 +270,11 @@ static void can_rx_task(void *arg)
             s_data.fuelTable = (fresh && stSeen) ? ((s_outpc[80] & 0x20) ? 3 : 1) : 0;  /* ftblsw bit5 -> VE3 */
             s_data.fuelTbl   = (fresh && stSeen) ? ((s_outpc[80] & 0x20) ? 3 : 1) : 0;
             s_data.revLimOn  = (fresh && stSeen) && (s_outpc[82] & 0x20);
+            /* Launch active only if: dash armed (bit0 cleared) AND ECU is polling us
+             * (poll seen within 100ms). If polls stop, ECU holds last value but we
+             * don't know it -> show inactive for safety. */
+            bool portsFresh = (now_ms - s_lastPortsPollMs) < 100;
+            s_data.launchActive = portsFresh && ((s_remotePorts & 0x01) == 0);
             s_data.probePolls = s_portsPollSeen;
             s_data.probeResp  = s_portsRespSent;
             s_data.probeReqId = s_portsPollId;
@@ -300,6 +297,8 @@ static void can_rx_task(void *arg)
              * open-loop, so the marker stays off until the user flips to CL. */
             bool tgSeen = s_seen[17];
             s_data.bstTargKpa = (fresh && tgSeen) ? (rdS16(136) / 10) : 0;
+            /* gp17 [3] = outpc.syncreason (U08, offset 139). 0=none, 2=missing tooth, 11=cam/crank, etc. */
+            s_data.syncLossReason = (fresh && tgSeen) ? s_outpc[139] : 0;
 
             s_data.canOk = fresh || sdbFresh;
             s_data.sdbOk = sdbFresh;
@@ -338,11 +337,6 @@ esp_err_t can_rx_init(void)
         ESP_LOGE(TAG, "Failed to create data mutex");
         return ESP_FAIL;
     }
-    s_stats_mutex = xSemaphoreCreateMutex();
-    if (!s_stats_mutex) {
-        ESP_LOGE(TAG, "Failed to create stats mutex");
-        return ESP_FAIL;
-    }
     memset(&s_data, 0, sizeof(s_data));
     memset(&s_stats, 0, sizeof(s_stats));
     memset(s_outpc, 0, sizeof(s_outpc));
@@ -357,8 +351,10 @@ esp_err_t can_rx_init(void)
     memset(&s_maBatt, 0, sizeof(s_maBatt));
     memset(&s_maAfr, 0, sizeof(s_maAfr));
 
-    const twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
+    g_config.tx_queue_len = 32;
+    g_config.rx_queue_len = 32;
     const twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
     const twai_filter_config_t f_config = {
         .acceptance_code = 0,
@@ -443,8 +439,9 @@ esp_err_t can_rx_get_link_payload(uint8_t outpc[72], uint16_t *mask)
 }
 
 /* On-demand TX probe (serial command CANTX): verifies transceiver + bus wiring
- * by transmitting one frame. BENCH TOOL ONLY — never fires on its own, so the
- * car bus sees no dash transmissions at boot or any other time. */
+ * by transmitting one frame. BENCH TOOL ONLY.
+ * NOTE: the dash also transmits CAN-poll port responses (MSG_RSP) on the bus
+ * when the ECU polls Remote Port 3 (var_off=167). */
 void can_rx_selftest_tx(void)
 {
     twai_message_t test = {0};
@@ -479,9 +476,13 @@ static volatile uint16_t s_a4mv = 0xFFFF;
 void can_rx_set_a4mv(uint16_t mv) { s_a4mv = mv; }
 uint16_t can_rx_get_a4mv(void)    { return s_a4mv; }
 
-/* Mode state from B0 v4 telemetry bytes [15..18] */
-static volatile uint8_t s_fanMode = 0;
-static volatile uint8_t s_iacMode = 0;
+/* Mode state from B0 v4 telemetry bytes [15..18].
+ * Power-on defaults must match the box's own factory defaults (iobox3 Cfg:
+ * fanAuto=true, iacFollow=true) so a v4-less/short 0xB0 frame leaves the dash
+ * showing the mode the box is actually in. 0 = manual, and a stale 0 here
+ * read as "IDLE MAN" until the first full frame arrived. */
+static volatile uint8_t s_fanMode = 1;   /* 0=man 1=auto 2=follow */
+static volatile uint8_t s_iacMode = 2;   /* 0=man 1=auto 2=follow */
 static volatile uint8_t s_buzzerOn = 0;
 
 void can_rx_set_fan_mode(uint8_t mode)    { s_fanMode = mode; }
@@ -491,7 +492,18 @@ uint8_t can_rx_get_iac_mode(void)        { return s_iacMode; }
 void can_rx_set_buzzer_on(uint8_t on)     { s_buzzerOn = on; }
 uint8_t can_rx_get_buzzer_on(void)       { return s_buzzerOn; }
 
+/* IAC duty from B0 v6 telemetry byte [14]. 0xFF = no telemetry seen yet. */
+static volatile uint8_t s_iacDuty = 0xFF;
+void can_rx_set_iac_duty(uint8_t duty) { s_iacDuty = duty; }
+uint8_t can_rx_get_iac_duty(void)       { return s_iacDuty; }
+
 /* Speed mph from B0 v5 telemetry byte [2]. 255 = no telemetry seen yet. */
 static volatile uint8_t s_speedMph = 255;
 void can_rx_set_speed(uint8_t mph) { s_speedMph = mph; }
 uint8_t can_rx_get_speed(void)     { return s_speedMph; }
+
+/* Launch status from ECU CAN-poll ports response. */
+bool can_rx_get_launch_active(void)
+{
+    return (s_remotePorts & 0x01) == 0;  /* active-low: bit0 cleared = launch active */
+}

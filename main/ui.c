@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_lv_adapter.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include <string.h>
 #include <math.h>
@@ -65,6 +66,9 @@ static bool s_face_dirty = false;   /* face changed; ui_face_persist_once() writ
 /* Per-face colour state: -1 = OFF (excluded from tap cycle, kept dormant),
  * 0 = AUTO (follow global accent), 1..THEME_COUNT = fixed theme colour. */
 static int8_t s_face_state[FACE_COUNT] = { 0, 0, 0 };
+/* Canvas buffer pointers — stored so we can free the original allocation
+ * (LVGL may align the pointer passed to lv_canvas_set_buffer). */
+static void *s_face_buf[FACE_COUNT] = { NULL };
 static const char *s_face_names[FACE_COUNT] = { "CLS", "OEM", "NDL" };
 
 /* needle-pointer geometry (FACE_NEEDLE only): a line from ~0.1R behind the hub
@@ -108,7 +112,7 @@ static bool s_ovr_latch;
 static lv_obj_t *s_val_lbl;
 static lv_obj_t *s_can_lbl;
 static lv_obj_t *s_mat_lbl;
-static lv_obj_t *s_tbl_lbl, *s_adv_lbl, *s_rlim_lbl;
+static lv_obj_t *s_tbl_lbl, *s_adv_lbl, *s_rlim_lbl, *s_launch_lbl, *s_sync_lbl;
 static bool s_rlim_vis;
 static lv_obj_t *s_iobox_lbl;
 static lv_obj_t *s_speed_val, *s_speed_unit;
@@ -165,6 +169,14 @@ static uint32_t s_accent = COL_GOOD;   /* current accent colour */
 static bool     s_night  = false;      /* reduced-glare night mode */
 static bool     s_theme_dirty = false;      /* theme or night changed; persist pending */
 static bool     s_shift_dirty = false;      /* shift-rpm changed; persist pending */
+static bool     s_gdamp_dirty = false;      /* gas damp changed; persist pending */
+static bool     s_glow_dirty  = false;      /* low fuel % changed; persist pending */
+static bool     s_iac_tgt_dirty = false;    /* IAC target RPM changed; persist pending */
+
+/* Settings baselines (dash-owned, resend on link-up) */
+static int16_t s_gdamp_val = 0;   /* mirror of box gasDamp */
+static int16_t s_glow_val  = 20;  /* mirror of box lowFuelPct */
+static int16_t s_iac_target_val = 900;    /* rpm */
 
 /* Launch/table are CAN-only: the dash CAN responder drives ECU Remote
  * Port3 bits (fuel-table VE3 + launch). No iobox3 outputs involved (O2/O3
@@ -206,6 +218,12 @@ static const char *warn_evaluate(const dash_data_t *d, uint32_t *color_out, bool
         return NULL;
     }
 
+    /* Primary stream fresh? (needed to gate AFR alarms -- during SDB-only fallback
+     * AFR is held at last primary value while TPS keeps updating from SDB,
+     * causing false LEAN/RICH triggers). */
+    uint32_t now_ms = esp_timer_get_time() / 1000;
+    bool primary_fresh = (now_ms - d->lastRxMs) < 1000;
+
     /* OVERREV from the live shift config so banner/strip/ring/glow share one
      * threshold; release with margin. */
     if (d->rpm >= s_shift_rpm_cfg) s_ovr_latch = true;
@@ -219,7 +237,8 @@ static const char *warn_evaluate(const dash_data_t *d, uint32_t *color_out, bool
     bool matOk  = d->mat > 0 && d->mat < WARN_MAT_MAX;
     bool onThr  = d->tps >= 50;
     bool battOk = d->batt > 0;
-    bool afrOk  = onThr && d->afr >= 90 && d->afr <= 260;
+    /* AFR alarms only when primary stream is fresh -- stale AFR + live TPS = false triggers */
+    bool afrOk  = primary_fresh && onThr && d->afr >= 90 && d->afr <= 260;
     bool mapOk  = d->map > 0 && d->map < 4000;   /* x10 units, sanity window */
 
     uint16_t ds = 0;
@@ -312,7 +331,7 @@ static void update_fan_mode_buttons(uint8_t mode);
 static void update_iac_mode_buttons(uint8_t mode);
 static void launch_evt(lv_event_t *e);
 static void table_evt(lv_event_t *e);
-static void update_launch_table(void);
+static void update_launch_table(const dash_data_t *d);
 static void update_buzzer_button(bool on);
 static void settings_shift_plus_evt(lv_event_t *e);
 static void settings_duty_minus_evt(lv_event_t *e);
@@ -440,6 +459,7 @@ static void gauge_paint_classic(lv_obj_t *parent) {
     lv_obj_t *canvas = lv_canvas_create(parent);
     lv_obj_remove_style_all(canvas);
     lv_canvas_set_buffer(canvas, fbuf, sz, sz, LV_COLOR_FORMAT_RGB565);
+    s_face_buf[FACE_CLASSIC] = fbuf;
     lv_canvas_fill_bg(canvas, lv_color_hex(COL_BG), LV_OPA_COVER);
     gauge_bg_blit(canvas);
     lv_obj_set_pos(canvas, cx - sz / 2, cy - sz / 2);
@@ -517,6 +537,7 @@ static void gauge_paint_oem(lv_obj_t *parent) {
     lv_obj_t *canvas = lv_canvas_create(parent);
     lv_obj_remove_style_all(canvas);
     lv_canvas_set_buffer(canvas, fbuf, sz, sz, LV_COLOR_FORMAT_RGB565);
+    s_face_buf[FACE_OEM] = fbuf;
     lv_canvas_fill_bg(canvas, lv_color_hex(COL_BG), LV_OPA_COVER);
     gauge_bg_blit(canvas);
     lv_obj_set_pos(canvas, cx - sz / 2, cy - sz / 2);
@@ -589,6 +610,7 @@ static void gauge_paint_needle(lv_obj_t *parent) {
     lv_obj_t *canvas = lv_canvas_create(parent);
     lv_obj_remove_style_all(canvas);
     lv_canvas_set_buffer(canvas, fbuf, sz, sz, LV_COLOR_FORMAT_RGB565);
+    s_face_buf[FACE_NEEDLE] = fbuf;
     lv_canvas_fill_bg(canvas, lv_color_hex(COL_BG), LV_OPA_COVER);
     gauge_bg_blit(canvas);
     lv_obj_set_pos(canvas, cx - sz / 2, cy - sz / 2);
@@ -657,12 +679,12 @@ static void gauge_paint_needle(lv_obj_t *parent) {
  * face toggle only repaints a canvas when its colour is actually stale. */
 static uint32_t s_face_baked[FACE_COUNT] = { 0 };
 
-static void face_canvas_del(lv_obj_t **slot) {
+static void face_canvas_del(lv_obj_t **slot, int face_idx) {
     if (!*slot) return;
-    lv_draw_buf_t *db = lv_canvas_get_draw_buf(*slot);
-    void *old = db ? db->data : NULL;
+    void *old = s_face_buf[face_idx];
     lv_obj_del(*slot);
     *slot = NULL;
+    s_face_buf[face_idx] = NULL;
     if (old) free(old);
 }
 
@@ -674,7 +696,7 @@ static void face_paint(int f, bool force) {
     if (!*carrier) return;
     uint32_t want = face_colour(f);
     if (!force && s_face_baked[f] == want) return;   /* already correct */
-    face_canvas_del(slot);
+    face_canvas_del(slot, f);
     if (f == FACE_CLASSIC) gauge_paint_classic(*carrier);
     else if (f == FACE_OEM) gauge_paint_oem(*carrier);
     else gauge_paint_needle(*carrier);
@@ -705,9 +727,10 @@ static void ui_theme_apply(void) {
     }
     /* Theme change must also reach the highlight buttons (FAN row, LAUNCH,
      * TABLE) — their own updaters key on state change or accent_live() and
-     * would otherwise keep the previous theme's colour. */
-    update_fan_mode_buttons(can_rx_get_fan_mode());
-    update_launch_table();
+     * would otherwise keep the previous theme's colour. Use gated s_prev
+     * value so a dead link shows "unknown" instead of a frozen mode. */
+    update_fan_mode_buttons(s_prev.fanMode);
+    update_launch_table(NULL);
     if (s_face_active == FACE_NEEDLE) {
         if (s_needle) lv_obj_set_style_line_color(s_needle, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
         if (s_needle_hub) lv_obj_set_style_bg_color(s_needle_hub, lv_color_hex(face_colour(FACE_NEEDLE)), 0);
@@ -1128,11 +1151,19 @@ static void ui_init_main_build(void) {
     lv_obj_set_style_text_font(s_tbl_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_pos(s_tbl_lbl, 430, 8);
 
+    /* Launch indicator (top strip, right of fuel table). Active-low from
+     * CAN-poll ports response (0x29D8070 bit0). Green when armed+active. */
+    s_launch_lbl = lv_label_create(s_scr_main);
+    lv_label_set_text(s_launch_lbl, "LAUNCH");
+    lv_obj_set_style_text_color(s_launch_lbl, lv_color_hex(COL_DIM), 0);
+    lv_obj_set_style_text_font(s_launch_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(s_launch_lbl, 470, 8);
+
     s_adv_lbl = lv_label_create(s_scr_main);
     lv_label_set_text(s_adv_lbl, "--.- deg");
     lv_obj_set_style_text_color(s_adv_lbl, lv_color_hex(COL_DIM), 0);
     lv_obj_set_style_text_font(s_adv_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(s_adv_lbl, 468, 8);
+    lv_obj_set_pos(s_adv_lbl, 540, 8);
 
     /* REV LIM chip — shows while the ECU's soft/hard rev limiter is retarding
      * spark (status3 bit5). Blinks like the latched indicator lamps. */
@@ -1204,9 +1235,19 @@ static void ui_init_main_build(void) {
     s_hb = lv_obj_create(s_scr_main);
     lv_obj_remove_style_all(s_hb);
     lv_obj_set_size(s_hb, 64, 26);
-    lv_obj_set_pos(s_hb, GAUGE_CX + 160, 8);   /* top-right: bottom-centre is the mph readout */
+    /* far right, below MAT label (x=700..780, y=8..24) */
+    lv_obj_set_pos(s_hb, 736, 30);
     lv_obj_add_flag(s_hb, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_hb, lamp_draw_cb, LV_EVENT_DRAW_MAIN, (void *)(intptr_t)2);
+
+    /* SYNC LOSS reason indicator — below CLT/TPS bars (right side) */
+    s_sync_lbl = lv_label_create(s_scr_main);
+    lv_label_set_text(s_sync_lbl, "SYNC --");
+    lv_obj_set_style_text_color(s_sync_lbl, lv_color_hex(COL_DIM), 0);
+    lv_obj_set_style_text_font(s_sync_lbl, &lv_font_montserrat_14, 0);
+    /* centered under CLT (x600..663) and TPS (x667..730) bars */
+    lv_obj_set_pos(s_sync_lbl, 630, 285);
+    lv_obj_add_flag(s_sync_lbl, LV_OBJ_FLAG_HIDDEN);
 
     /* shift light strip (gauge center, above RPM title) */
     for (int i = 0; i < SHIFT_SEGS; i++) {
@@ -1435,29 +1476,58 @@ static void face_toggle_evt(lv_event_t *e) {
 }
 
 /* Called from a dedicated (non-LVGL) task so the NVS flash commit runs on a
- * real stack. Flash write outside the touch/render context is safe. */
+ * real stack. Flash write outside the touch/render context is safe.
+ * Clear dirty flags BEFORE reading values to avoid lost updates
+ * (race between LVGL task setting flags and persist task clearing them). */
 void ui_face_persist_once(void)
 {
-    if (!s_face_dirty && !s_theme_dirty && !s_shift_dirty) return;
+    bool face_dirty = false, theme_dirty = false, shift_dirty = false;
+    int face_active = 0;
+    int32_t face_state[FACE_COUNT] = {0};
+    int32_t accent = 0;
+    int32_t night = 0;
+    int32_t shift_rpm = 0;
+    int32_t gdamp_val = 0;
+    int32_t glow_val = 0;
+    int32_t iac_tgt_val = 0;
+    bool gdamp_was_dirty = false;
+    bool glow_was_dirty = false;
+    bool iac_tgt_was_dirty = false;
+
+    if (!s_face_dirty && !s_theme_dirty && !s_shift_dirty && !s_gdamp_dirty && !s_glow_dirty && !s_iac_tgt_dirty) return;
+
+    if (s_face_dirty) { face_dirty = true; face_active = s_face_active; for (int i = 0; i < FACE_COUNT; i++) face_state[i] = s_face_state[i]; s_face_dirty = false; }
+    if (s_theme_dirty) { theme_dirty = true; accent = s_accent; night = s_night; s_theme_dirty = false; }
+    if (s_shift_dirty) { shift_dirty = true; shift_rpm = s_shift_rpm_cfg; s_shift_dirty = false; }
+    if (s_gdamp_dirty) { gdamp_was_dirty = true; gdamp_val = s_gdamp_val; s_gdamp_dirty = false; }
+    if (s_glow_dirty)  { glow_was_dirty = true; glow_val = s_glow_val; s_glow_dirty = false; }
+    if (s_iac_tgt_dirty) { iac_tgt_was_dirty = true; iac_tgt_val = s_iac_target_val; s_iac_tgt_dirty = false; }
+
     nvs_handle_t h;
     if (nvs_open("dashui", NVS_READWRITE, &h) == ESP_OK) {
-        if (s_face_dirty) {
-            nvs_set_i32(h, "face", s_face_active);
+        if (face_dirty) {
+            nvs_set_i32(h, "face", face_active);
             for (int i = 0; i < FACE_COUNT; i++) {
                 char key[8];
                 snprintf(key, sizeof(key), "fst%d", i);
-                nvs_set_i32(h, key, (int32_t)s_face_state[i]);
+                nvs_set_i32(h, key, face_state[i]);
             }
-            s_face_dirty = false;
         }
-        if (s_theme_dirty) {
-            nvs_set_i32(h, "accent", (int32_t)s_accent);
-            nvs_set_i32(h, "night",  s_night ? 1 : 0);
-            s_theme_dirty = false;
+        if (theme_dirty) {
+            nvs_set_i32(h, "accent", accent);
+            nvs_set_i32(h, "night", night);
         }
-        if (s_shift_dirty) {
-            nvs_set_i32(h, "shift_rpm", s_shift_rpm_cfg);
-            s_shift_dirty = false;
+        if (shift_dirty) {
+            nvs_set_i32(h, "shift_rpm", shift_rpm);
+        }
+        if (gdamp_was_dirty) {
+            nvs_set_i32(h, "gdamp", gdamp_val);
+        }
+        if (glow_was_dirty) {
+            nvs_set_i32(h, "glow", glow_val);
+        }
+        if (iac_tgt_was_dirty) {
+            nvs_set_i32(h, "iac_target", iac_tgt_val);
         }
         nvs_commit(h);
         nvs_close(h);
@@ -1504,20 +1574,25 @@ static void iac_follow_evt(lv_event_t *e) {
     can_tx_iac_follow(true);
 }
 
-static int8_t s_iac_duty_val = 50;   /* default MAN duty % (also used by settings page) */
+static int8_t s_iac_duty_val = -1;   /* MAN duty %; seeded from 0xB0 frame on first settings open, fallback 50 */
 
 static void iac_man_evt(lv_event_t *e) {
     (void)e;
     can_tx_iac_manual((uint8_t)s_iac_duty_val);
 }
 
-/* Launch arm / table switch highlight — truth exactly like the fan buttons:
- * local flag AND the ECU CAN stream is live (s_can_ok). CAN-only since
- * 2026-09-25 (iobox O2/O3 paths + source switcher removed). */
-static void update_launch_table(void) {
+/* Launch arm / table switch highlight — truth from ECU's own data:
+ * launchActive = dash armed AND ECU polling us (poll <100ms)
+ * fuelTable == 3 = ECU's ftblsw bit set (VE3 active)
+ * Both gated on CAN stream health (s_can_ok). CAN-only since
+ * 2026-09-25 (iobox O2/O3 paths + source switcher removed).
+ * Pass d = current frame data; if NULL, uses s_prev (last frame). */
+static void update_launch_table(const dash_data_t *d) {
     if (!s_main_launch || !s_main_table) return;
-    bool l_on = s_launch_armed && s_can_ok;
-    bool t_on = s_table_on && s_can_ok;
+    if (!d) d = &s_prev;
+    bool l_on = d->launchActive;
+    bool t_on = (d->fuelTable == 3);
+    if (!s_can_ok) { l_on = false; t_on = false; }
     /* Re-style on an actual change (called every frame) OR when the accent
      * changes (theme swatch / night toggle) — the old diff-guard cached the
      * rendered colour, so accent changes never reached these buttons. */
@@ -1536,17 +1611,14 @@ static void launch_evt(lv_event_t *e) {
     (void)e;
     s_launch_armed = !s_launch_armed;
     can_rx_set_launch_btn(s_launch_armed);   /* CAN Remote Port3 bit0 */
-    update_launch_table();
-    printf("[PROBE] BTN LAUNCH %s\n", s_launch_armed ? "ON" : "OFF");
+    update_launch_table(NULL);
 }
 
 static void table_evt(lv_event_t *e) {
     (void)e;
     s_table_on = !s_table_on;
     can_rx_set_table_btn(s_table_on);        /* CAN Remote Port3 bit1 */
-    update_launch_table();
-    printf("[PROBE] BTN TABLE %s -> ports=0x%02X\n", s_table_on ? "VE3" : "VE1",
-           (unsigned)can_rx_probe_ports());
+    update_launch_table(NULL);
 }
 
 static void ui_init_main_show(void) {
@@ -1561,13 +1633,9 @@ static void ui_init_main_show(void) {
 
 static int16_t  s_shift_rpm_val  = SHIFT_RPM_DEFAULT;
 static bool     s_buzz_on        = false;
-static int16_t  s_iac_target_val = 900;    /* rpm */
 static lv_obj_t *s_shift_val_lbl, *s_duty_val_lbl, *s_buzz_lbl;
-static lv_obj_t *s_buzz_btn;
 static lv_obj_t *s_gas_set_lbl, *s_gdamp_val_lbl, *s_glow_val_lbl;
 static lv_timer_t *s_gas_timer;
-static int16_t s_gdamp_val = 0;   /* mirror of box gasDamp */
-static int16_t s_glow_val  = 20;  /* mirror of box lowFuelPct */
 static lv_obj_t *s_tgt_val_lbl;
 
 /* NVS persistence for dash-side settings ("dashui" namespace).
@@ -1611,6 +1679,13 @@ static void settings_nvs_load(void) {
                 if ((uint32_t)v == s_theme_colors[i]) { s_accent = (uint32_t)v; break; }
         if (nvs_get_i32(h, "night", &v) == ESP_OK && v >= 0 && v <= 1)
             s_night = (v == 1);
+        /* Settings baselines (dash-owned, resend on link-up) */
+        if (nvs_get_i32(h, "gdamp", &v) == ESP_OK && v >= 0 && v <= 255)
+            s_gdamp_val = (int16_t)v;
+        if (nvs_get_i32(h, "glow", &v) == ESP_OK && v >= 0 && v <= 100)
+            s_glow_val = (int16_t)v;
+        if (nvs_get_i32(h, "iac_target", &v) == ESP_OK && v >= 500 && v <= 3000)
+            s_iac_target_val = (int16_t)v;
         nvs_close(h);
     }
 }
@@ -1754,12 +1829,11 @@ static void settings_gdamp_evt(lv_event_t *e) {
     if (v < 0) v = 0;
     if (v > 15) v = 15;
     s_gdamp_val = (int16_t)v;
+    s_gdamp_dirty = true;
     char buf[12];
     lv_snprintf(buf, sizeof(buf), "%d", s_gdamp_val);
     lv_label_set_text(s_gdamp_val_lbl, buf);
-    char cmd[10];
-    lv_snprintf(cmd, sizeof(cmd), "D %d", s_gdamp_val);
-    can_tx_send_cmd('Q', cmd);
+    can_tx_gas_damp((uint8_t)s_gdamp_val);
 }
 
 static void settings_glow_evt(lv_event_t *e) {
@@ -1768,12 +1842,11 @@ static void settings_glow_evt(lv_event_t *e) {
     if (v < 5) v = 5;
     if (v > 90) v = 90;
     s_glow_val = (int16_t)v;
+    s_glow_dirty = true;
     char buf[12];
     lv_snprintf(buf, sizeof(buf), "%d%%", s_glow_val);
     lv_label_set_text(s_glow_val_lbl, buf);
-    char cmd[10];
-    lv_snprintf(cmd, sizeof(cmd), "W %d", s_glow_val);
-    can_tx_send_cmd('Q', cmd);
+    can_tx_low_fuel_pct((uint8_t)s_glow_val);
 }
 
 static void gas_timer_cb(lv_timer_t *t) {
@@ -1796,6 +1869,7 @@ static void settings_iac_target_step(int16_t d) {
     if (v < 500) v = 500;
     if (v > 1500) v = 1500;
     s_iac_target_val = (int16_t)v;
+    s_iac_tgt_dirty = true;
     can_tx_iac_target_rpm(s_iac_target_val);
     char buf[16];
     lv_snprintf(buf, sizeof(buf), "%d", s_iac_target_val);
@@ -1871,7 +1945,13 @@ static void build_settings(void) {
     int y = 50;
     char buf[16];
     static lv_style_t btn_style;
-    lv_style_init(&btn_style);
+    static bool btn_style_inited = false;
+    if (!btn_style_inited) {
+        lv_style_init(&btn_style);
+        btn_style_inited = true;
+    } else {
+        lv_style_reset(&btn_style);
+    }
     lv_style_set_bg_color(&btn_style, lv_color_hex(0x2A2A3A));
     lv_style_set_bg_opa(&btn_style, LV_OPA_COVER);
     lv_style_set_radius(&btn_style, 6);
@@ -2212,6 +2292,11 @@ void ui_show_settings(void) {
     update_buzzer_button(s_prev.buzzerOn);
     theme_highlight();
     face_highlight();
+    /* Seed IAC manual duty from box's live 0xB0 frame (fallback 50) */
+    if (s_iac_duty_val < 0) {
+        uint8_t box_duty = can_rx_get_iac_duty();
+        s_iac_duty_val = (box_duty == 0xFF) ? 50 : (int8_t)box_duty;
+    }
 }
 
 /* Settings button highlighting helpers — guard against NULL (page not built yet) */
@@ -2252,7 +2337,11 @@ static void update_buzzer_button(bool on) {
 }
 
 void ui_update(const dash_data_t *d) {
-    bool ok = d->canOk;
+    /* Detect CAN task death: if lastRxMs is stale (>2s), force canOk=false
+     * so UI shows CAN LOST instead of frozen data. */
+    uint32_t now_ms = esp_timer_get_time() / 1000;
+    bool can_task_alive = (now_ms - d->lastRxMs) < 2000;
+    bool ok = d->canOk && can_task_alive;
     char buf[32];
 
     lv_obj_set_style_text_color(s_can_lbl, lv_color_hex(ok ? COL_GOOD : COL_BAD), 0);
@@ -2264,6 +2353,19 @@ void ui_update(const dash_data_t *d) {
         bool bo = d->ioboxOk;
         lv_label_set_text(s_iobox_lbl, bo ? "BOX OK" : "BOX LOST");
         lv_obj_set_style_bg_color(s_iobox_lbl, lv_color_hex(bo ? COL_GOOD : COL_BAD), 0);
+        /* Link came up — resend baselines so box learns dash's values.
+         * NOTE: the IAC mode is deliberately NOT sent here. 'I' + a number is
+         * the iobox3 MANUAL command (case 'I' falls through to manual for any
+         * value that isn't exactly "F" or "A"), so resending a duty here forced
+         * the box out of FOLLOW into MANUAL on every link-up — that is what kept
+         * resetting the dash to "IDLE MAN". The box persists its whole Cfg
+         * struct to NVS, so a link drop loses neither the mode nor the duty and
+         * there is nothing to restore. Changing IAC mode is a user action only. */
+        if (bo) {
+            can_tx_gas_damp((uint8_t)s_gdamp_val);
+            can_tx_low_fuel_pct((uint8_t)s_glow_val);
+            can_tx_iac_target_rpm(s_iac_target_val);
+        }
     }
 
     /* RPM: slide star cursor over the load-up ring; on the NEEDLE face rotate
@@ -2440,6 +2542,13 @@ void ui_update(const dash_data_t *d) {
     if (strcmp(lv_label_get_text(s_tbl_lbl), buf) != 0)
         lv_label_set_text(s_tbl_lbl, buf);
 
+    /* launch indicator (active-low from CAN-poll ports response bit0) */
+    if (ok && d->launchActive) {
+        lv_obj_set_style_text_color(s_launch_lbl, lv_color_hex(COL_GOOD), 0);
+    } else {
+        lv_obj_set_style_text_color(s_launch_lbl, lv_color_hex(COL_DIM), 0);
+    }
+
     if (ok && d->sparkAdv10 != INT32_MIN) {
         int32_t v = d->sparkAdv10;
         bool neg = v < 0;
@@ -2457,6 +2566,19 @@ void ui_update(const dash_data_t *d) {
         if (rlim) lv_obj_remove_flag(s_rlim_lbl, LV_OBJ_FLAG_HIDDEN);
         else      lv_obj_add_flag(s_rlim_lbl, LV_OBJ_FLAG_HIDDEN);
     }
+
+    /* SYNC LOSS reason: show ECU lost sync reason code (0=none, 2=missing tooth, 11=cam/crank, etc.) */
+    if (ok && d->syncLossReason > 0) {
+        lv_snprintf(buf, sizeof(buf), "SYNC %d", d->syncLossReason);
+        lv_obj_set_style_text_color(s_sync_lbl, lv_color_hex(COL_BAD), 0);
+        lv_obj_remove_flag(s_sync_lbl, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_snprintf(buf, sizeof(buf), "SYNC --");
+        lv_obj_set_style_text_color(s_sync_lbl, lv_color_hex(COL_DIM), 0);
+        lv_obj_add_flag(s_sync_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (strcmp(lv_label_get_text(s_sync_lbl), buf) != 0)
+        lv_label_set_text(s_sync_lbl, buf);
 
     if (ok) {
         lv_snprintf(buf, sizeof(buf), "IAC %d%%", (int)(d->iacstep * 100 / 255));
@@ -2506,6 +2628,15 @@ void ui_update(const dash_data_t *d) {
         s_hb_vis = s_hb_on;
         if (s_hb_vis) lv_obj_remove_flag(s_hb, LV_OBJ_FLAG_HIDDEN);
         else          lv_obj_add_flag(s_hb, LV_OBJ_FLAG_HIDDEN);
+        /* Auto night mode: high beam ON -> night mode ON; high beam OFF -> night mode OFF */
+        if (s_night != s_hb_on) {
+            s_night = s_hb_on;
+            s_theme_dirty = true;
+            if (s_night_btn && s_night_lbl) {
+                lv_obj_set_style_bg_color(s_night_btn, lv_color_hex(s_night ? COL_GOOD : 0x2A2A3A), 0);
+                lv_label_set_text(s_night_lbl, s_night ? "NIGHT ON" : "NIGHT OFF");
+            }
+        }
     }
 
     /* shift light strip */
@@ -2539,13 +2670,9 @@ void ui_update(const dash_data_t *d) {
     if (d->buzzerOn != s_prev.buzzerOn)
         update_buzzer_button(d->buzzerOn);
 
-    /* Launch/table highlight truth, fan-pattern: CAN mode = local flag gated
-     * on ECU stream health; IO-BOX mode = box-echoed O1-7 bits (0xB0 f[18]
-     * @10Hz) gated on ESP-NOW link health — dead link or no echo = dark,
-     * exactly like fanMode. Re-evaluated every frame; the helper only
-     * re-styles on an actual change. */
+    /* Launch/table highlight — ECU truth gated on CAN health */
     s_can_ok = d->canOk;
-    update_launch_table();
+    update_launch_table(d);
 
     s_prev = *d;
 }

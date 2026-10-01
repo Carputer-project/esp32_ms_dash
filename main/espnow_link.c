@@ -40,6 +40,9 @@ static void link_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, i
             can_rx_set_gas(data[5]);                              /* v3: gas% */
             can_rx_set_a4mv(data[12] | (data[13] << 8));          /* v2: A4 source-mV */
         }
+        if (len >= 15) {                                          /* v6: IAC duty */
+            can_rx_set_iac_duty(data[14]);
+        }
         if (len >= 19) {                                          /* v4: mode state */
             can_rx_set_fan_mode(data[15]);
             can_rx_set_iac_mode(data[16]);

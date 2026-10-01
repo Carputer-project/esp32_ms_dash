@@ -1,6 +1,7 @@
 #include "can_tx.h"
 #include "esp_log.h"
 #include "espnow_link.h"
+#include <stdio.h>
 
 static const char *TAG = "CAN_TX";
 
@@ -46,6 +47,18 @@ esp_err_t can_tx_iac_target_rpm(int16_t rpm) {
     char val[8];
     snprintf(val, sizeof(val), "%d", rpm);
     return can_tx_send_cmd('T', val);
+}
+
+esp_err_t can_tx_gas_damp(uint8_t damp) {
+    char val[16];
+    snprintf(val, sizeof(val), "D %d", damp);
+    return can_tx_send_cmd('Q', val);
+}
+
+esp_err_t can_tx_low_fuel_pct(uint8_t pct) {
+    char val[16];
+    snprintf(val, sizeof(val), "W %d", pct);
+    return can_tx_send_cmd('Q', val);
 }
 
 esp_err_t can_tx_buzzer(bool on) {

@@ -29,7 +29,7 @@ typedef struct {
     bool     indL;
     bool     indR;
     bool     highBeam;
-    /* MS2/Extra spark-table select + live ignition advance (gp01/gp10, local
+    /* MS2/Extra fuel-table select + live ignition advance (gp01/gp10, local
      * decode — NOT part of the ESP-NOW link; the link only carries the first
      * 9 outpc groups and this data lives beyond it on the CAN bus). */
     uint8_t  fuelTable;     /* active fuel table: 1 or 3 (3 = status1 ftblsw on -> VE3) */
@@ -46,6 +46,8 @@ typedef struct {
     uint8_t  iacMode;      // 0=man, 1=auto, 2=follow (from iobox3 0xB0)
     bool     buzzerOn;     // from iobox3 0xB0
     uint8_t  speedMph;     // from iobox3 0xB0 f[2] (ABS/LM393 input)
+    bool     launchActive; // from ECU CAN-poll ports response (0x29D8070 bit0, active-low)
+    uint8_t  syncLossReason; // ECU lost sync reason code (0=none, 2=missing tooth, 11=cam/crank, etc.)
     uint32_t lastRxMs;
     uint32_t lastSdbMs;
 } dash_data_t;
@@ -79,8 +81,13 @@ void can_rx_set_buzzer_on(uint8_t on);     /* B0 v4 byte [17]: 0/1 */
 uint8_t can_rx_get_fan_mode(void);         /* last box-echoed fan mode (0/1/2) */
 uint8_t can_rx_get_iac_mode(void);         /* last box-echoed iac mode (0/1/2) */
 uint8_t can_rx_get_buzzer_on(void);        /* last box-echoed buzzer state (0/1) */
+void can_rx_set_iac_duty(uint8_t duty);    /* B0 v6 byte [14]: 0-100% IAC duty */
+uint8_t can_rx_get_iac_duty(void);         /* last reported IAC duty, 0xFF = none yet */
 void can_rx_set_speed(uint8_t mph);        /* B0 v5 byte [2]: 0-255 mph, 255 = none yet */
 uint8_t can_rx_get_speed(void);            /* last reported speed, 255 = none yet */
+
+/* Launch status from ECU CAN-poll ports response. */
+bool can_rx_get_launch_active(void);
 
 /* CAN Remote Port probe (2026-09-24): dash buttons drive the Remote Port 3
  * byte fed back to the ECU's CAN-poll ports request. bit1 CLEARED = VE3 table

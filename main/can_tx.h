@@ -29,6 +29,9 @@ esp_err_t can_tx_iac_target_rpm(int16_t rpm);
 esp_err_t can_tx_buzzer(bool on);
 esp_err_t can_tx_buzzer_test(void);
 
+esp_err_t can_tx_gas_damp(uint8_t damp);
+esp_err_t can_tx_low_fuel_pct(uint8_t pct);
+
 esp_err_t can_tx_led(uint8_t r, uint8_t g, uint8_t b);
 esp_err_t can_tx_led_off(void);
 
