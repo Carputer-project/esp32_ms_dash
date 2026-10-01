@@ -2,11 +2,16 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# Board is a Waveshare ESP32-S3-Touch-LCD-7, ESP32-S3 N16R8: 16 MB flash, 8 MB PSRAM.
+# This was previously 8MB and disagreed with sdkconfig's 16MB — a regenerated config
+# (fresh clone, deleted sdkconfig) would have declared the wrong flash size.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
-CONFIG_SPIRAM_MEMTEST=n
+# Boot-time PSRAM test. Costs a few seconds of boot time; catches a marginal PSRAM,
+# which on this board shows up as a garbled/half-drawn LCD rather than an error.
+CONFIG_SPIRAM_MEMTEST=y
 CONFIG_SPIRAM_RODATA=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_FREERTOS_HZ=1000
@@ -14,8 +19,14 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_DATA_CACHE_64KB=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
-CONFIG_EXAMPLE_LVGL_PORT_TASK_CORE=1
-CONFIG_EXAMPLE_LVGL_PORT_AVOID_TEAR_ENABLE=y
+# -Os, not the default -Og debug level. App is 1.42 MB against a 1500K factory
+# partition; size-optimising is what makes the pending CAN_RX_GROUPS 18->44
+# (Broadcast-2 gp43) decode affordable WITHOUT repartitioning the flash.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# A task that stops feeding the idle task now reboots the dash instead of silently
+# freezing on stale gauges. The 5 s timeout is generous vs the worst measured
+# blocking path (TFT begin() ~300 ms/display).
+CONFIG_ESP_TASK_WDT_PANIC=y
 
 CONFIG_LV_OS_FREERTOS=y
 CONFIG_LV_USE_CLIB_MALLOC=y
@@ -34,6 +45,5 @@ CONFIG_LV_FONT_MONTSERRAT_24=y
 CONFIG_LV_FONT_MONTSERRAT_30=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 # CONFIG_LV_USE_DEMO_WIDGETS is not set
-CONFIG_LV_USE_PERF_MONITOR=y
 # CONFIG_LV_USE_DEMO_BENCHMARK is not set
 # CONFIG_LV_USE_DEMO_STRESS is not set
