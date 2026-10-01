@@ -102,7 +102,22 @@ Gotchas learned on this hardware:
   port disappears mid-flash, re-seat the cable and retry at `-b 115200`.
 - Copying this project to another path requires `idf.py fullclean` first (CMake
   caches absolute paths).
-- App size ~1.29 MB against a 1.5 MB factory partition (~17% free).
+- App size ~1.32 MB against the 1.5 MB factory partition (~14% free). Built
+  with `CONFIG_COMPILER_OPTIMIZATION_SIZE=y` (`-Os`), which freed ~94 KB versus
+  `-Og`; both `sdkconfig` and `sdkconfig.defaults` must agree, since `sdkconfig`
+  wins at build time and `defaults` only applies on a fresh config. Do not
+  re-add `-Og` without rechecking this line.
+- **The partition table is stock `partitions_singleapp_large.csv`** (nvs, phy_init,
+  factory). There is NO `otadata`, `ota_0` or `ota_1`, so OTA code compiles in but
+  has nowhere to land — the dash cannot receive an OTA update as partitioned. A
+  `TWO_OTA_LARGE` layout would fit in the board's 16 MB with room to spare but
+  needs one physical reflash to install. Inspect the live layout with:
+  ```bash
+  python3 ~/esp/esp-idf/components/partition_table/gen_esp32part.py \
+          build/partition_table/partition-table.bin
+  ```
+  (use plain `python3` with the file path — the compiled `.py` has null bytes and
+  raises a SyntaxError if run through the idf env's `-m` form)
 - **Do NOT enable a USB-Serial-JTAG console driver here.** GPIO19/20 are both
   the CAN transceiver pins *and* the S3 USB D−/D+ pads: installing the USJ
   driver reconfigures the pad mux after TWAI init and silently severs CAN RX
