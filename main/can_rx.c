@@ -266,10 +266,23 @@ static void can_rx_task(void *arg)
             /* Spark table + rev-lim from gp10 status bytes, live timing from
              * gp01 (adv_deg @8). status1 bit6 stblsw = 3rd spark table active
              * (T3); status3 bit5 REVLIMSFT = soft/hard rev limiter engaged. */
-            bool stSeen = s_seen[10];
-            s_data.fuelTable = (fresh && stSeen) ? ((s_outpc[80] & 0x20) ? 3 : 1) : 0;  /* ftblsw bit5 -> VE3 */
-            s_data.fuelTbl   = (fresh && stSeen) ? ((s_outpc[80] & 0x20) ? 3 : 1) : 0;
-            s_data.revLimOn  = (fresh && stSeen) && (s_outpc[82] & 0x20);
+            /* Table select + rev limiter. Offsets verified against
+             * megasquirt2.ini [OutputChannels] lines 5383-5387:
+             *   status1  = U08, 78   status3 = U08, 80   looptime = U16, 82
+             * and [Indicator] lines 5120/5121/5135:
+             *   { status1 & 32 } = "Fuel Tbl sw"  (ftblsw, VE select)
+             *   { status1 & 64 } = "Spk Tbl sw"   (stblsw)
+             *   { status3 & 32 } = "No soft limit"/"Soft limiter"
+             * Broadcast group N covers bytes N*8..N*8+7, so status1@78 is in
+             * group 9 and status3@80 is in group 10 -- they are NOT the same
+             * group and must be gated separately. Previously all three reads
+             * used byte 80/82 gated on group 10, which meant the VE indicator
+             * was driven by the rev limiter and revLimOn by the loop timer. */
+            bool ftSeen = s_seen[9];    /* status1 @78 -> group 9  (bytes 72-79) */
+            bool stSeen = s_seen[10];   /* status3 @80 -> group 10 (bytes 80-87) */
+            s_data.fuelTable = (fresh && ftSeen) ? ((s_outpc[78] & 0x20) ? 3 : 1) : 0;
+            s_data.fuelTbl   = (fresh && ftSeen) ? ((s_outpc[78] & 0x20) ? 3 : 1) : 0;
+            s_data.revLimOn  = (fresh && stSeen) && (s_outpc[80] & 0x20);
             /* Launch active only if: dash armed (bit0 cleared) AND ECU is polling us
              * (poll seen within 100ms). If polls stop, ECU holds last value but we
              * don't know it -> show inactive for safety. */
@@ -280,13 +293,13 @@ static void can_rx_task(void *arg)
             s_data.probeReqId = s_portsPollId;
             s_data.probeRspId = s_rspId;
 
-            /* PROBE: print ECU broadcast status1 bit transitions — bit5 ftblsw
-             * (fuel table switch, the TRUTH for VE) and bit6 stblsw (spark). */
+            /* Print status1 bit transitions: bit5 ftblsw (fuel table switch, the
+             * TRUTH for VE) and bit6 stblsw (spark). status1 is byte 78. */
             static uint8_t s_lastSt1 = 0xFF;
-            if (fresh && stSeen && s_outpc[80] != s_lastSt1) {
-                s_lastSt1 = s_outpc[80];
-                printf("[CAN] status1=0x%02X ftblsw=%d stblsw=%d\n", s_outpc[80],
-                       (s_outpc[80] & 0x20) ? 1 : 0, (s_outpc[80] & 0x40) ? 1 : 0);
+            if (fresh && ftSeen && s_outpc[78] != s_lastSt1) {
+                s_lastSt1 = s_outpc[78];
+                printf("[CAN] status1=0x%02X ftblsw=%d stblsw=%d\n", s_outpc[78],
+                       (s_outpc[78] & 0x20) ? 1 : 0, (s_outpc[78] & 0x40) ? 1 : 0);
             }
 
             bool advSeen = s_seen[1];
@@ -297,8 +310,18 @@ static void can_rx_task(void *arg)
              * open-loop, so the marker stays off until the user flips to CL. */
             bool tgSeen = s_seen[17];
             s_data.bstTargKpa = (fresh && tgSeen) ? (rdS16(136) / 10) : 0;
-            /* gp17 [3] = outpc.syncreason (U08, offset 139). 0=none, 2=missing tooth, 11=cam/crank, etc. */
-            s_data.syncLossReason = (fresh && tgSeen) ? s_outpc[139] : 0;
+            /* SYNC LOSS reason: NOT decoded. Byte 139 was being read as
+             * outpc.syncreason, but per the INI Broadcast-2 dialog line 2568
+             * gp17 is boost_targ1,boostduty1,MAFv -- bytes 139-142 are the
+             * MAFv float32, so that read returned a float mantissa byte and lit
+             * a meaningless "SYNC nnn" almost continuously. synccnt/reason/
+             * timing_err are Broadcast-2 gp43 (INI line 2577) = bytes 344-347,
+             * which is outside CAN_RX_GROUPS=18 (max byte 143) and is not
+             * captured at all. Decoding it properly needs CAN_RX_GROUPS >= 44,
+             * which is ~208 more bytes of RX buffer -- decide against the
+             * partition headroom before attempting. Until then report 0 so the
+             * UI hides the label rather than showing noise. */
+            s_data.syncLossReason = 0;
 
             s_data.canOk = fresh || sdbFresh;
             s_data.sdbOk = sdbFresh;
@@ -373,18 +396,12 @@ esp_err_t can_rx_init(void)
     printf("[CAN] Status: state=%d msgs_to_tx=%" PRIu32 " msgs_to_rx=%" PRIu32 " tx_err=%" PRIu32 " rx_err=%" PRIu32 " tx_failed=%" PRIu32 "\n",
            status.state, status.msgs_to_tx, status.msgs_to_rx, status.tx_error_counter, status.rx_error_counter, status.tx_failed_count);
 
-    /* TEMP RESTORE (A/B test): boot-time TX probe reinstated to check whether
-     * its presence affects RX. Original gating rationale unchanged otherwise. */
-    twai_message_t test = {0};
-    test.identifier = 0x7FF;
-    test.data_length_code = 2;
-    test.data[0] = 0xAA;
-    test.data[1] = 0x55;
-    if (twai_transmit(&test, pdMS_TO_TICKS(100)) == ESP_OK) {
-        printf("[CAN] Self-test TX OK (check bus wiring if no RX)\n");
-    } else {
-        printf("[CAN] Self-test TX FAILED (bus off? no termination?)\n");
-    }
+    /* Boot-time CAN TX probe removed (2026-10-01).
+     * It sent an unsolicited 0x7FF frame on the vehicle bus at every power-up.
+     * 0x7FF is the OBD-II "functional tester present" ID, so this was an
+     * unrequested broadcast from production firmware, gated by nothing, on a
+     * customer's car. It existed only as a bench "is the bus wired?" check;
+     * the serial-command path can_rx_selftest_tx() covers that case properly. */
 
     BaseType_t xret = xTaskCreatePinnedToCore(
         can_rx_task, "can_rx", CAN_RX_TASK_STACK, NULL,
