@@ -249,12 +249,30 @@ static void can_rx_task(void *arg)
         if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             int32_t rawRpm, rawMap, rawClt, rawMat, rawTps, rawBatt, rawAfr, rawBaro;
             int16_t rawIac;
-            rawRpm  = fresh ? rdU16(6)  : (sdbFresh ? rdU16be(&s_sdb[2], 0)  : 0);
-            rawMap  = fresh ? rdS16(18) : (sdbFresh ? rdS16be(&s_sdb[0], 0)  : 0);
-            rawClt  = fresh ? rdS16(22) : (sdbFresh ? rdS16be(&s_sdb[4], 0)  : 0);
-            rawMat  = fresh ? rdS16(20) : (sdbFresh ? rdS16be(&s_sdb[12], 0) : 0);
-            rawTps  = fresh ? rdS16(24) : (sdbFresh ? rdS16be(&s_sdb[6], 0)  : 0);
-            rawBatt = fresh ? rdS16(26) : (sdbFresh ? rdS16be(&s_sdb[24], 0) : 0);
+            /* sdbFresh is a TIME gate only: it says an SDB frame arrived within
+             * 1 s, not WHICH groups arrived. The fallback below reads fixed
+             * offsets in s_sdb[], so a partial SDB stream was treated as a
+             * complete one - an ECU that broadcasts only group 0 would have had
+             * MAT (group 1) and BATT (group 3) read out of groups that never
+             * existed, i.e. zeroed memory presented as a live reading. Group
+             * offsets in s_sdb[]: 0 -> rpm/map/clt/tps, 1 -> mat, 3 -> batt.
+             *
+             * s_sdbSeen[] has been written on every SDB frame since it was
+             * added and read by nothing, which is exactly the question this
+             * needs answered. A missing group now yields 0, which the UI already
+             * renders as "no data" - the same value the !sdbFresh branch gives.
+             *
+             * AFR and IAC step have no SDB equivalent and are already held in
+             * s_lastAfr/s_lastIac, updated only while the outpc path is fresh. */
+            const bool sdb0 = sdbFresh && s_sdbSeen[0];
+            const bool sdb1 = sdbFresh && s_sdbSeen[1];
+            const bool sdb3 = sdbFresh && s_sdbSeen[3];
+            rawRpm  = fresh ? rdU16(6)  : (sdb0 ? rdU16be(&s_sdb[2], 0)  : 0);
+            rawMap  = fresh ? rdS16(18) : (sdb0 ? rdS16be(&s_sdb[0], 0)  : 0);
+            rawClt  = fresh ? rdS16(22) : (sdb0 ? rdS16be(&s_sdb[4], 0)  : 0);
+            rawMat  = fresh ? rdS16(20) : (sdb1 ? rdS16be(&s_sdb[12], 0) : 0);
+            rawTps  = fresh ? rdS16(24) : (sdb0 ? rdS16be(&s_sdb[6], 0)  : 0);
+            rawBatt = fresh ? rdS16(26) : (sdb3 ? rdS16be(&s_sdb[24], 0) : 0);
             if (fresh) {
                 s_lastAfr = rdS16(28);
                 s_lastIac = rdS16(54);
