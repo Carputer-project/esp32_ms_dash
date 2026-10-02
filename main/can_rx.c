@@ -30,10 +30,33 @@ static uint8_t  s_sdb[CAN_SDB_MSGS * 8];
 static bool     s_sdbSeen[CAN_SDB_MSGS];
 static uint32_t s_lastRxMs = 0;
 static uint32_t s_lastSdbMs = 0;
-static uint32_t s_lastDashMs = 0;
-static uint8_t  s_dashB0 = 0;
-static uint8_t  s_dashB3 = 0;
-static bool     s_dashSeen = false;
+
+/* Dash status block - TWO concurrent writers, NEITHER holding s_data_mutex:
+ *
+ *   1. can_rx_task(), from the CAN RX path (msg.identifier == CAN_DASH_ID)
+ *   2. can_rx_set_dash_status(), called from link_recv_cb() in the WiFi task
+ *      on the 0xB0 ESP-NOW frame from iobox3
+ *
+ * The reader (can_rx_get_data_copy) takes s_data_mutex, which gives NO ordering
+ * guarantee against either of them. So the mutex is not what makes these reads
+ * safe, and anyone reasoning "it is under the lock" is wrong.
+ *
+ * What actually makes them safe is width: on Xtensa a uint8_t store is a single
+ * atomic byte and s_lastDashMs is a naturally-aligned 32-bit store, so no value
+ * can be torn or read half-updated. The residual, accepted, and harmless here,
+ * is that B0 and B3 can come from different writers and be a mismatched pair -
+ * both paths carry the same box's state, so the values agree.
+ *
+ * volatile, not a critical section, deliberately: taking s_data_mutex from the
+ * WiFi callback would risk stalling the WiFi task on a 5 ms timeout, to fix a
+ * hazard that width already removes. This is the same reasoning the iobox3 side
+ * applies to s_dashMac. Documented rather than papered over, because the claim
+ * "it is under the lock" is exactly the kind of thing that stops being true
+ * during a later refactor. */
+static volatile uint32_t s_lastDashMs = 0;
+static volatile uint8_t  s_dashB0 = 0;
+static volatile uint8_t  s_dashB3 = 0;
+static volatile bool     s_dashSeen = false;
 
 /* ---- CAN Remote Port responder (2026-09-24) ----
  * Answers the ECU's MS2/Extra CAN-poll ports request (MSG_REQ) with a MSG_RSP
