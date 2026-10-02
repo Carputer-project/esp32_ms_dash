@@ -12,8 +12,8 @@ esp_err_t can_tx_send_cmd(char key, const char *val);
 esp_err_t can_tx_fan_auto(bool auto_mode);
 esp_err_t can_tx_fan_manual(bool on);
 
-esp_err_t can_tx_iac_auto(bool auto_mode);
-esp_err_t can_tx_iac_follow(bool follow);
+esp_err_t can_tx_iac_auto(void);
+esp_err_t can_tx_iac_follow(void);
 esp_err_t can_tx_iac_manual(uint8_t duty_pct);
 esp_err_t can_tx_iac_target_rpm(int16_t rpm);
 

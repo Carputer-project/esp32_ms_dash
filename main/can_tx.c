@@ -28,12 +28,27 @@ esp_err_t can_tx_fan_manual(bool on) {
     return can_tx_send_cmd('F', on ? "1" : "0");
 }
 
-esp_err_t can_tx_iac_auto(bool auto_mode) {
-    return can_tx_send_cmd('I', auto_mode ? "A" : "0");
+/* NOTE: no bool parameter, deliberately. These used to take one and mapped
+ * false -> "I 0", which looks like "turn auto off" but is NOT: the box parses
+ * `I 0` as MANUAL 0% DUTY, i.e. park the idle-air valve at its closed stop.
+ * The box's `I` command has exactly three forms - `I F` follow the ECU,
+ * `I A` follow the coolant curve, `I <0-100>` manual duty - and there is no
+ * "neither" state to select.
+ *
+ * So a false here was never a valid request, it was a way to shut the valve
+ * shut by accident. Both call sites passed a literal true, so nothing was
+ * broken; this removes the trap rather than documenting it. The UI has three
+ * separate buttons (auto / follow / manual) and none of them is a toggle, so
+ * nothing needs the "off" case.
+ *
+ * Contrast can_tx_fan_manual(), which DOES take a bool: `F 0` is a genuine
+ * fan-off button and the fan has a real off state. */
+esp_err_t can_tx_iac_auto(void) {
+    return can_tx_send_cmd('I', "A");
 }
 
-esp_err_t can_tx_iac_follow(bool follow) {
-    return can_tx_send_cmd('I', follow ? "F" : "0");
+esp_err_t can_tx_iac_follow(void) {
+    return can_tx_send_cmd('I', "F");
 }
 
 esp_err_t can_tx_iac_manual(uint8_t duty_pct) {

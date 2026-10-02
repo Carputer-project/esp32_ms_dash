@@ -1616,12 +1616,12 @@ static void fan_off_evt(lv_event_t *e) {
 
 static void iac_auto_evt(lv_event_t *e) {
     (void)e;
-    can_tx_iac_auto(true);
+    can_tx_iac_auto();
 }
 
 static void iac_follow_evt(lv_event_t *e) {
     (void)e;
-    can_tx_iac_follow(true);
+    can_tx_iac_follow();
 }
 
 static int8_t s_iac_duty_val = -1;   /* MAN duty %; seeded from 0xB0 frame on first settings open, fallback 50 */
