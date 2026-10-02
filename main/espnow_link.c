@@ -32,7 +32,28 @@ static void link_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, i
     if (!data || len < 1) return;
     if (data[0] == FRAME_STATUS && len >= 8) {
         s_rxB0Count++;
-        can_rx_set_dash_status(data[1], data[4]);
+        /* Per-field length guards below are correct as far as they go - each
+         * field is only consumed when the frame is long enough to carry it. The
+         * defect was the LINK FRESHNESS stamp, not the field reads.
+         *
+         * can_rx_set_dash_status() unconditionally sets s_lastDashMs, so ANY
+         * frame of 8..13 bytes declared the link alive and left
+         * s_data.ioboxOk / dashFresh reading true - while gas %, A4 mV, IAC
+         * duty and all three mode echoes stayed frozen at their last values,
+         * because those setters are behind len>=14/15/19. The dash would show a
+         * healthy link, live indicator and warning state taken from the
+         * attacker's bytes, and a fuel gauge frozen mid-value.
+         *
+         * iobox3 always sends 19 bytes, so our own firmware cannot produce a
+         * short frame. Anything shorter is either a future protocol revision or
+         * a third party on an UNAUTHENTICATED link - and this callback accepts
+         * any sender's MAC, so a 8-byte frame is trivially forgeable.
+         *
+         * Freshness is therefore gated on a frame that actually carries the full
+         * current field set. Short frames still update the fields they DO carry
+         * (that is the point of the per-field versioning), they just do not
+         * count as proof that the link is healthy. */
+        const bool full = (len >= 19);
         if (len >= 3) {
             can_rx_set_speed(data[2]);                          /* v5: speed mph */
         }
@@ -43,12 +64,15 @@ static void link_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, i
         if (len >= 15) {                                          /* v6: IAC duty */
             can_rx_set_iac_duty(data[14]);
         }
-        if (len >= 19) {                                          /* v4: mode state */
+        if (full) {                                               /* v4: mode state */
             can_rx_set_fan_mode(data[15]);
             can_rx_set_iac_mode(data[16]);
             can_rx_set_buzzer_on(data[17]);
             /* 0xB0 f[18] (bootTest) is not consumed */
         }
+        /* LAST, and only for a full frame: this is the call that stamps
+         * s_lastDashMs, which is what makes dashFresh / ioboxOk true. */
+        if (full) can_rx_set_dash_status(data[1], data[4]);
     }
 }
 
