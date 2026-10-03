@@ -3,6 +3,8 @@
 #include "esp_lv_adapter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "waveshare_rgb_lcd_port.h"
 #include "can_rx.h"
@@ -99,7 +101,7 @@ void app_main(void)
     ESP_ERROR_CHECK(waveshare_rgb_lcd_backlight_on());
 
     esp_lv_adapter_config_t adapter_config = ESP_LV_ADAPTER_DEFAULT_CONFIG();
-    adapter_config.task_stack_size = 12 * 1024;
+    adapter_config.task_stack_size = 20 * 1024;
     adapter_config.stack_in_psram = true;
     ESP_ERROR_CHECK(esp_lv_adapter_init(&adapter_config));
 
@@ -138,9 +140,15 @@ void app_main(void)
     ESP_ERROR_CHECK(espnow_link_init());
 
     ESP_LOGI(TAG, "Starting CAN UI update task (20Hz)");
-    xTaskCreate(can_update_task, "can_update", 4096, NULL, 5, NULL);
+    xTaskCreateWithCaps(can_update_task, "can_update", 4096, NULL, 5, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     ESP_LOGI(TAG, "Starting UI persistence task");
+    /* Internal RAM stack REQUIRED: this task calls nvs_commit(), which is a
+     * flash write. Flash writes freeze the cache, and the cache-freeze code
+     * asserts the current task's stack is in memory that stays accessible
+     * (s_task_stack_is_sane_when_cache_frozen). PSRAM does not, so a PSRAM
+     * stack here asserts the moment a settings change triggers a write -
+     * i.e. on every button press on the settings page. */
     xTaskCreate(ui_persist_task, "ui_persist", 4096, NULL, 3, NULL);
 
     /* console DISABLED: usb_serial_jtag_driver_install reconfigures the

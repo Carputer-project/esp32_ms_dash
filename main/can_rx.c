@@ -5,6 +5,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/twai.h"
@@ -444,9 +446,9 @@ esp_err_t can_rx_init(void)
      * customer's car. It existed only as a bench "is the bus wired?" check;
      * the serial-command path can_rx_selftest_tx() covers that case properly. */
 
-    BaseType_t xret = xTaskCreatePinnedToCore(
+    BaseType_t xret = xTaskCreatePinnedToCoreWithCaps(
         can_rx_task, "can_rx", CAN_RX_TASK_STACK, NULL,
-        CAN_RX_TASK_PRIO, NULL, CAN_RX_TASK_CORE);
+        CAN_RX_TASK_PRIO, NULL, CAN_RX_TASK_CORE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (xret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create CAN RX task");
         return ESP_FAIL;

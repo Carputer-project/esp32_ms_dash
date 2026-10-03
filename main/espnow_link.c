@@ -3,6 +3,8 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -149,9 +151,9 @@ esp_err_t espnow_link_init(void)
     peer.encrypt = false;
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
 
-    BaseType_t xret = xTaskCreatePinnedToCore(
+    BaseType_t xret = xTaskCreatePinnedToCoreWithCaps(
         link_tx_task, "espnow_tx", LINK_TX_STACK, NULL,
-        LINK_TX_PRIO, NULL, LINK_TX_CORE);
+        LINK_TX_PRIO, NULL, LINK_TX_CORE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (xret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create link TX task");
         return ESP_FAIL;

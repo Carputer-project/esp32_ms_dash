@@ -6,6 +6,8 @@
 #include "esp_lv_adapter.h"
 #include "esp_timer.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <math.h>
 #include "lvgl.h"
@@ -1529,6 +1531,36 @@ static void face_toggle_evt(lv_event_t *e) {
  * real stack. Flash write outside the touch/render context is safe.
  * Clear dirty flags BEFORE reading values to avoid lost updates
  * (race between LVGL task setting flags and persist task clearing them). */
+/* Re-arm the claimed dirty flags after a failed NVS write.
+ *
+ * The flags are cleared at the top of ui_face_persist_once() so a change
+ * arriving mid-write cannot be lost (see the critical section there). That
+ * makes a FAILED write worse than no write at all: without this the change
+ * would be flagged as saved, then silently vanish on the next power cycle.
+ * Re-arming means the next 500 ms tick simply tries again. */
+static void rearm_persist_flags(bool face, bool theme, bool shift,
+                                bool gdamp, bool glow, bool iac)
+{
+    if (face)  s_face_dirty      = true;
+    if (theme) s_theme_dirty     = true;
+    if (shift) s_shift_dirty     = true;
+    if (gdamp) s_gdamp_dirty     = true;
+    if (glow)  s_glow_dirty      = true;
+    if (iac)   s_iac_tgt_dirty   = true;
+}
+
+/* Spinlock guarding the claim-and-clear of the dirty flags in
+ * ui_face_persist_once() below. ESP-IDF's Xtensa port takes a portMUX_TYPE*
+ * for taskENTER_CRITICAL, and on this dual-core S3 that also takes the other
+ * core's lock, so the claim is atomic against a concurrent writer on either
+ * core. */
+static portMUX_TYPE s_persist_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Called from a dedicated (non-LVGL) task so the NVS flash commit runs on a
+ * real stack. Flash write outside the touch/render context is safe.
+ * The dirty flags are claimed and their values snapshotted together in one
+ * critical section at the top - see inside for why splitting those two steps
+ * is what caused the gauge-cycle crash. */
 void ui_face_persist_once(void)
 {
     bool face_dirty = false, theme_dirty = false, shift_dirty = false;
@@ -1544,44 +1576,80 @@ void ui_face_persist_once(void)
     bool glow_was_dirty = false;
     bool iac_tgt_was_dirty = false;
 
-    if (!s_face_dirty && !s_theme_dirty && !s_shift_dirty && !s_gdamp_dirty && !s_glow_dirty && !s_iac_tgt_dirty) return;
+    /* CLAIM the pending work, atomically, then snapshot the values.
+     *
+     * This was "read value, then clear flag". Two bugs in that order:
+     *  1. A change landing between the value read and the flag clear had its
+     *     flag cleared without its value ever being captured, so it was
+     *     silently dropped - never persisted, no log, no symptom until the
+     *     setting reverted on the next power cycle.
+     *  2. The clear and the read are six plain bools with nothing preventing
+     *     preemption between them. The writers are LVGL event handlers and
+     *     this is ui_persist_task at prio 3, so on a busy tick the LVGL task
+     *     CAN land in that window.
+     *
+     * Claiming inside a critical section makes read-and-clear indivisible:
+     * either this task sees the flag set (and owns the write) or the change
+     * arrives after the section and simply re-arms the flag for the next
+     * 500 ms tick. ~20 instructions, so the section is far shorter than
+     * FreeRTOS's interrupt-off budget even on the dual-core S3. */
+    taskENTER_CRITICAL(&s_persist_mux);
+    face_dirty      = s_face_dirty;      s_face_dirty      = false;
+    theme_dirty     = s_theme_dirty;     s_theme_dirty     = false;
+    shift_dirty     = s_shift_dirty;     s_shift_dirty     = false;
+    gdamp_was_dirty = s_gdamp_dirty;     s_gdamp_dirty     = false;
+    glow_was_dirty  = s_glow_dirty;      s_glow_dirty      = false;
+    iac_tgt_was_dirty = s_iac_tgt_dirty; s_iac_tgt_dirty   = false;
+    /* Snapshot INSIDE the section. A change arriving after this point simply
+     * re-arms the flag and is written on the next 500 ms tick. */
+    if (face_dirty) { face_active = s_face_active; for (int i = 0; i < FACE_COUNT; i++) face_state[i] = s_face_state[i]; }
+    if (theme_dirty) { accent = s_accent; night = s_night; }
+    if (shift_dirty) { shift_rpm = s_shift_rpm_cfg; }
+    if (gdamp_was_dirty) { gdamp_val = s_gdamp_val; }
+    if (glow_was_dirty)  { glow_val = s_glow_val; }
+    if (iac_tgt_was_dirty) { iac_tgt_val = s_iac_target_val; }
+    taskEXIT_CRITICAL(&s_persist_mux);
 
-    if (s_face_dirty) { face_dirty = true; face_active = s_face_active; for (int i = 0; i < FACE_COUNT; i++) face_state[i] = s_face_state[i]; s_face_dirty = false; }
-    if (s_theme_dirty) { theme_dirty = true; accent = s_accent; night = s_night; s_theme_dirty = false; }
-    if (s_shift_dirty) { shift_dirty = true; shift_rpm = s_shift_rpm_cfg; s_shift_dirty = false; }
-    if (s_gdamp_dirty) { gdamp_was_dirty = true; gdamp_val = s_gdamp_val; s_gdamp_dirty = false; }
-    if (s_glow_dirty)  { glow_was_dirty = true; glow_val = s_glow_val; s_glow_dirty = false; }
-    if (s_iac_tgt_dirty) { iac_tgt_was_dirty = true; iac_tgt_val = s_iac_target_val; s_iac_tgt_dirty = false; }
+    if (!face_dirty && !theme_dirty && !shift_dirty &&
+        !gdamp_was_dirty && !glow_was_dirty && !iac_tgt_was_dirty) return;
 
     nvs_handle_t h;
-    if (nvs_open("dashui", NVS_READWRITE, &h) == ESP_OK) {
-        if (face_dirty) {
-            nvs_set_i32(h, "face", face_active);
-            for (int i = 0; i < FACE_COUNT; i++) {
-                char key[8];
-                snprintf(key, sizeof(key), "fst%d", i);
-                nvs_set_i32(h, key, face_state[i]);
-            }
-        }
-        if (theme_dirty) {
-            nvs_set_i32(h, "accent", accent);
-            nvs_set_i32(h, "night", night);
-        }
-        if (shift_dirty) {
-            nvs_set_i32(h, "shift_rpm", shift_rpm);
-        }
-        if (gdamp_was_dirty) {
-            nvs_set_i32(h, "gdamp", gdamp_val);
-        }
-        if (glow_was_dirty) {
-            nvs_set_i32(h, "glow", glow_val);
-        }
-        if (iac_tgt_was_dirty) {
-            nvs_set_i32(h, "iac_target", iac_tgt_val);
-        }
-        nvs_commit(h);
-        nvs_close(h);
+    esp_err_t err = nvs_open("dashui", NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open(dashui) failed: %s - settings NOT saved", esp_err_to_name(err));
+        rearm_persist_flags(face_dirty, theme_dirty, shift_dirty,
+                          gdamp_was_dirty, glow_was_dirty, iac_tgt_was_dirty);
+        return;
     }
+
+    if (face_dirty) {
+        nvs_set_i32(h, "face", face_active);
+        for (int i = 0; i < FACE_COUNT; i++) {
+            char key[8];
+            snprintf(key, sizeof(key), "fst%d", i);
+            nvs_set_i32(h, key, face_state[i]);
+        }
+    }
+    if (theme_dirty) {
+        nvs_set_i32(h, "accent", accent);
+        nvs_set_i32(h, "night", night);
+    }
+    if (shift_dirty)  nvs_set_i32(h, "shift_rpm", shift_rpm);
+    if (gdamp_was_dirty) nvs_set_i32(h, "gdamp", gdamp_val);
+    if (glow_was_dirty)  nvs_set_i32(h, "glow", glow_val);
+    if (iac_tgt_was_dirty) nvs_set_i32(h, "iac_target", iac_tgt_val);
+
+    /* nvs_commit() is the only one that matters: every nvs_set_i32 above is
+     * buffered and discarded if the commit fails. It used to be unchecked, so
+     * a failed write lost the setting with its dirty flag already cleared and
+     * nothing in the log said so. */
+    err = nvs_commit(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_commit failed: %s - settings LOST", esp_err_to_name(err));
+        rearm_persist_flags(face_dirty, theme_dirty, shift_dirty,
+                          gdamp_was_dirty, glow_was_dirty, iac_tgt_was_dirty);
+    }
+    nvs_close(h);
 }
 
 void ui_theme_apply_once(void)
@@ -1850,7 +1918,9 @@ static void face_highlight(void);
 static void face_cycle_evt(lv_event_t *e) {
     int f = (int)(intptr_t)lv_event_get_user_data(e);
     if (f < 0 || f >= FACE_COUNT) return;
-    int8_t st = s_face_state[f];
+    int8_t st;
+    taskENTER_CRITICAL(&s_persist_mux);
+    st = s_face_state[f];
     if (f == s_face_active) {
         /* active face: never go OFF, just advance colour (AUTO -> 1 -> ... -> n -> AUTO) */
         st++;
@@ -1862,6 +1932,7 @@ static void face_cycle_evt(lv_event_t *e) {
     }
     s_face_state[f] = st;
     s_face_dirty = true;
+    taskEXIT_CRITICAL(&s_persist_mux);
     if (f == s_face_active) {
         face_paint(f, true);   /* active: re-bake now (also frees old buffer) */
         if (f == FACE_NEEDLE && s_needle) {
