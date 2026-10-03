@@ -215,7 +215,8 @@ static const uint32_t kShiftColors[SHIFT_SEGS] = { COL_GOOD, COL_GOOD, COL_WARN,
 static const uint32_t s_theme_colors[THEME_COUNT] = { COL_GOOD, COL_AFR, COL_MAG, COL_BOOST };
 static uint32_t s_accent = COL_GOOD;   /* current accent colour */
 static bool     s_night  = false;      /* reduced-glare night mode */
-static bool     s_theme_dirty = false;      /* theme or night changed; persist pending */
+static bool     s_theme_dirty = false;      /* accent changed; persist pending */
+static bool     s_night_dirty = false;      /* manual night changed; persist pending */
 static bool     s_shift_dirty = false;      /* shift-rpm changed; persist pending */
 static bool     s_gdamp_dirty = false;      /* gas damp changed; persist pending */
 static bool     s_glow_dirty  = false;      /* low fuel % changed; persist pending */
@@ -1538,11 +1539,12 @@ static void face_toggle_evt(lv_event_t *e) {
  * makes a FAILED write worse than no write at all: without this the change
  * would be flagged as saved, then silently vanish on the next power cycle.
  * Re-arming means the next 500 ms tick simply tries again. */
-static void rearm_persist_flags(bool face, bool theme, bool shift,
+static void rearm_persist_flags(bool face, bool theme, bool night, bool shift,
                                 bool gdamp, bool glow, bool iac)
 {
     if (face)  s_face_dirty      = true;
     if (theme) s_theme_dirty     = true;
+    if (night) s_night_dirty     = true;
     if (shift) s_shift_dirty     = true;
     if (gdamp) s_gdamp_dirty     = true;
     if (glow)  s_glow_dirty      = true;
@@ -1563,7 +1565,7 @@ static portMUX_TYPE s_persist_mux = portMUX_INITIALIZER_UNLOCKED;
  * is what caused the gauge-cycle crash. */
 void ui_face_persist_once(void)
 {
-    bool face_dirty = false, theme_dirty = false, shift_dirty = false;
+    bool face_dirty = false, theme_dirty = false, night_dirty = false, shift_dirty = false;
     int face_active = 0;
     int32_t face_state[FACE_COUNT] = {0};
     int32_t accent = 0;
@@ -1596,6 +1598,7 @@ void ui_face_persist_once(void)
     taskENTER_CRITICAL(&s_persist_mux);
     face_dirty      = s_face_dirty;      s_face_dirty      = false;
     theme_dirty     = s_theme_dirty;     s_theme_dirty     = false;
+    night_dirty     = s_night_dirty;     s_night_dirty     = false;
     shift_dirty     = s_shift_dirty;     s_shift_dirty     = false;
     gdamp_was_dirty = s_gdamp_dirty;     s_gdamp_dirty     = false;
     glow_was_dirty  = s_glow_dirty;      s_glow_dirty      = false;
@@ -1603,21 +1606,22 @@ void ui_face_persist_once(void)
     /* Snapshot INSIDE the section. A change arriving after this point simply
      * re-arms the flag and is written on the next 500 ms tick. */
     if (face_dirty) { face_active = s_face_active; for (int i = 0; i < FACE_COUNT; i++) face_state[i] = s_face_state[i]; }
-    if (theme_dirty) { accent = s_accent; night = s_night; }
+    if (theme_dirty) { accent = s_accent; }
+    if (night_dirty) { night = s_night; }
     if (shift_dirty) { shift_rpm = s_shift_rpm_cfg; }
     if (gdamp_was_dirty) { gdamp_val = s_gdamp_val; }
     if (glow_was_dirty)  { glow_val = s_glow_val; }
     if (iac_tgt_was_dirty) { iac_tgt_val = s_iac_target_val; }
     taskEXIT_CRITICAL(&s_persist_mux);
 
-    if (!face_dirty && !theme_dirty && !shift_dirty &&
+    if (!face_dirty && !theme_dirty && !night_dirty && !shift_dirty &&
         !gdamp_was_dirty && !glow_was_dirty && !iac_tgt_was_dirty) return;
 
     nvs_handle_t h;
     esp_err_t err = nvs_open("dashui", NVS_READWRITE, &h);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "nvs_open(dashui) failed: %s - settings NOT saved", esp_err_to_name(err));
-        rearm_persist_flags(face_dirty, theme_dirty, shift_dirty,
+        rearm_persist_flags(face_dirty, theme_dirty, night_dirty, shift_dirty,
                           gdamp_was_dirty, glow_was_dirty, iac_tgt_was_dirty);
         return;
     }
@@ -1630,10 +1634,8 @@ void ui_face_persist_once(void)
             nvs_set_i32(h, key, face_state[i]);
         }
     }
-    if (theme_dirty) {
-        nvs_set_i32(h, "accent", accent);
-        nvs_set_i32(h, "night", night);
-    }
+    if (theme_dirty) nvs_set_i32(h, "accent", accent);
+    if (night_dirty) nvs_set_i32(h, "night", night);
     if (shift_dirty)  nvs_set_i32(h, "shift_rpm", shift_rpm);
     if (gdamp_was_dirty) nvs_set_i32(h, "gdamp", gdamp_val);
     if (glow_was_dirty)  nvs_set_i32(h, "glow", glow_val);
@@ -1646,7 +1648,7 @@ void ui_face_persist_once(void)
     err = nvs_commit(h);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nvs_commit failed: %s - settings LOST", esp_err_to_name(err));
-        rearm_persist_flags(face_dirty, theme_dirty, shift_dirty,
+        rearm_persist_flags(face_dirty, theme_dirty, night_dirty, shift_dirty,
                           gdamp_was_dirty, glow_was_dirty, iac_tgt_was_dirty);
     }
     nvs_close(h);
@@ -1884,7 +1886,7 @@ static void theme_evt(lv_event_t *e) {
 static void night_evt(lv_event_t *e) {
     (void)e;
     s_night = !s_night;
-    s_theme_dirty = true;
+    s_night_dirty = true;
     s_theme_apply_pending = true;
     theme_highlight();
 }
@@ -2012,8 +2014,14 @@ static void gas_timer_cb(lv_timer_t *t) {
 
 static void settings_iac_target_step(int16_t d) {
     int v = s_iac_target_val + d;
+    /* 500-3000 to match BOTH the iobox3 'T' handler (main.cpp, rejects
+     * outside this with "T 500-3000 rpm") and settings_nvs_load(). This was
+     * clamped to 1500, so a stored value above that - set over the box's
+     * serial port, or by earlier firmware - loaded, displayed and was pushed
+     * to the box correctly, then one tap of -100 silently snapped it to 1500
+     * and persisted the loss. A 1000 rpm drop in a single tap. */
     if (v < 500) v = 500;
-    if (v > 1500) v = 1500;
+    if (v > 3000) v = 3000;
     s_iac_target_val = (int16_t)v;
     s_iac_tgt_dirty = true;
     can_tx_iac_target_rpm(s_iac_target_val);
@@ -2804,10 +2812,13 @@ void ui_update(const dash_data_t *d) {
         s_hb_vis = s_hb_on;
         if (s_hb_vis) lv_obj_remove_flag(s_hb, LV_OBJ_FLAG_HIDDEN);
         else          lv_obj_add_flag(s_hb, LV_OBJ_FLAG_HIDDEN);
-        /* Auto night mode: high beam ON -> night mode ON; high beam OFF -> night mode OFF */
+        /* Auto night mode: high beam ON -> night mode ON; high beam OFF -> night mode OFF.
+         * RUNTIME ONLY — sets s_theme_apply_pending, NOT s_theme_dirty. s_theme_dirty
+         * is the NVS-persist flag, so flicking the high beam queued a flash commit
+         * every time. Auto night is a reaction to a driving state, not a preference. */
         if (s_night != s_hb_on) {
             s_night = s_hb_on;
-            s_theme_dirty = true;
+            s_theme_apply_pending = true;
             if (s_night_btn && s_night_lbl) {
                 lv_obj_set_style_bg_color(s_night_btn, lv_color_hex(s_night ? COL_GOOD : 0x2A2A3A), 0);
                 lv_label_set_text(s_night_lbl, s_night ? "NIGHT ON" : "NIGHT OFF");

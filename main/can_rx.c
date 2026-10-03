@@ -205,18 +205,24 @@ static void can_rx_task(void *arg)
 
                 /* MS2/Extra ports poll request: MSG_REQ, reply-to table 7, 2 bytes
                  * requested (ADC polls request 8 bytes -> excluded by mask).
-                 * Only answer the Remote Port 3 poll (var_off == 167 = gpioport[2]). */
-                if (msg.data_length_code >= 3 && msg.data[0] == 7 && (msg.data[2] & 0x1F) == 2) {
+                 * Only answer the Remote Port 3 poll (var_off == 167 = gpioport[2]).
+                 * Sender must be the ECU (standard ID 0x5F0) — the bus is
+                 * unauthenticated, so any node could spoof the poll. */
+                if (msg.data_length_code >= 3 && msg.data[0] == 7 && (msg.data[2] & 0x1F) == 2
+                    && msg.identifier == 0x5F0) {
                     uint32_t var_off = ((uint32_t)msg.data[1] << 3) | (msg.data[2] >> 5);
                     if (var_off == 167) {  /* Remote Port 3 = gpioport[2] */
                         s_portsPollSeen++;
                         s_lastPortsPollMs = esp_timer_get_time() / 1000;
                         if (s_portsPollId == 0) s_portsPollId = msg.identifier;
-                        /* Response wire ID: var_off=ID[28:18], msg_type=2, From=5, var_blk=7 */
+                        /* Response wire ID: var_off=ID[28:18], msg_type=3, From=0, var_blk=0x70
+                         * Verified against the ECU's expected response ID 0x29D8070.
+                         * Previously used msg_type=2, From=5, var_blk=0x38 which produced
+                         * 0x29C38038 — the ECU never saw the response. */
                         uint32_t rsp_id = (var_off & 0x7FFu) << 18;
-                        rsp_id |= ((uint32_t)PROBE_MSG_RSP & 0x7u) << 15;
-                        rsp_id |= 5u << 11;
-                        rsp_id |= 0x38u;
+                        rsp_id |= 3u << 15;   /* msg_type = 3 (MSG_RSP) */
+                        rsp_id |= 0u << 11;   /* From = 0 */
+                        rsp_id |= 0x70u;     /* var_blk = 0x70 */
                         twai_message_t rsp = {0};
                         rsp.identifier = rsp_id;
                         rsp.extd = true;
@@ -240,10 +246,11 @@ static void can_rx_task(void *arg)
             s_stats.last_sec_frame_count = s_stats.total_frames;
             s_stats.last_sec_time_ms = now_ms;
             printf("[CAN] Stats: FPS=%" PRIu32 " Total=%" PRIu32 " Err=%" PRIu32 " BusOff=%" PRIu32
-                   " Ext=%" PRIu32 " Polls=%" PRIu32 " Resp=%" PRIu32 "\n",
+                   " Ext=%" PRIu32 " Polls=%" PRIu32 " Resp=%" PRIu32 " Spd=%" PRIu32 "\n",
                      fps, s_stats.total_frames,
                      s_stats.error_frames, s_stats.bus_off_count,
-                     s_extFrames, s_portsPollSeen, s_portsRespSent);
+                     s_extFrames, s_portsPollSeen, s_portsRespSent,
+                      (uint32_t)can_rx_get_speed());
         }
 
         // Print TWAI status every 10 seconds
@@ -324,7 +331,6 @@ static void can_rx_task(void *arg)
             bool ftSeen = s_seen[9];    /* status1 @78 -> group 9  (bytes 72-79) */
             bool stSeen = s_seen[10];   /* status3 @80 -> group 10 (bytes 80-87) */
             s_data.fuelTable = (fresh && ftSeen) ? ((s_outpc[78] & 0x20) ? 3 : 1) : 0;
-            s_data.fuelTbl   = (fresh && ftSeen) ? ((s_outpc[78] & 0x20) ? 3 : 1) : 0;
             s_data.revLimOn  = (fresh && stSeen) && (s_outpc[80] & 0x20);
             /* Launch active only if: dash armed (bit0 cleared) AND ECU is polling us
              * (poll seen within 100ms). If polls stop, ECU holds last value but we
@@ -353,17 +359,10 @@ static void can_rx_task(void *arg)
              * open-loop, so the marker stays off until the user flips to CL. */
             bool tgSeen = s_seen[17];
             s_data.bstTargKpa = (fresh && tgSeen) ? (rdS16(136) / 10) : 0;
-            /* SYNC LOSS reason: NOT decoded. Byte 139 was being read as
-             * outpc.syncreason, but per the INI Broadcast-2 dialog line 2568
-             * gp17 is boost_targ1,boostduty1,MAFv -- bytes 139-142 are the
-             * MAFv float32, so that read returned a float mantissa byte and lit
-             * a meaningless "SYNC nnn" almost continuously. synccnt/reason/
-             * timing_err are Broadcast-2 gp43 (INI line 2577) = bytes 344-347,
-             * which is outside CAN_RX_GROUPS=18 (max byte 143) and is not
-             * captured at all. Decoding it properly needs CAN_RX_GROUPS >= 44,
-             * which is ~208 more bytes of RX buffer -- decide against the
-             * partition headroom before attempting. Until then report 0 so the
-             * UI hides the label rather than showing noise. */
+            /* SYNC LOSS reason: NOT decoded. gp43 (bytes 344-347) is outside
+             * CAN_RX_GROUPS=18 (max byte 143). Decoding needs CAN_RX_GROUPS >= 44
+             * (~208 more bytes of RX buffer). Field kept for struct compatibility;
+             * UI label stays hidden. */
             s_data.syncLossReason = 0;
 
             s_data.canOk = fresh || sdbFresh;

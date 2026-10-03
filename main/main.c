@@ -111,12 +111,18 @@ void app_main(void)
     disp_config.profile.use_psram = true;
 
     lv_display_t *disp = esp_lv_adapter_register_display(&disp_config);
-    assert(disp != NULL);
+    if (disp == NULL) {
+        ESP_LOGE(TAG, "esp_lv_adapter_register_display returned NULL");
+        abort();
+    }
 
     if (touch_handle != NULL) {
         esp_lv_adapter_touch_config_t touch_config = ESP_LV_ADAPTER_TOUCH_DEFAULT_CONFIG(disp, touch_handle);
         lv_indev_t *touch = esp_lv_adapter_register_touch(&touch_config);
-        assert(touch != NULL);
+        if (touch == NULL) {
+            ESP_LOGE(TAG, "esp_lv_adapter_register_touch returned NULL");
+            abort();
+        }
     }
 
     ESP_ERROR_CHECK(esp_lv_adapter_start());
