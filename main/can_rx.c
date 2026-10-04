@@ -249,32 +249,21 @@ static void can_rx_task(void *arg)
                         s_portsPollSeen++;
                         s_lastPortsPollMs = esp_timer_get_time() / 1000;
                         if (s_portsPollId == 0) s_portsPollId = msg.identifier;
-                        /* Response wire ID — must mirror the ECU's can_build_msg()
-                         * layout (ms2_extra_can.c:1033-1039); the whole 29-bit id is
-                         * stored into the MSCAN IDR registers as plain big-endian
-                         * bytes (`*(unsigned long*)&CAN_TB0_IDR0 = id`):
-                         *   ID[28:21] = off   (deposit offset into outpc)
-                         *   ID[20:19] = SRR+IDE
-                         *   ID[18:16] = msg_type      (2 = MSG_RSP)
-                         *   ID[15:12] = mycan_id/From
-                         *   ID[11:8]  = to            (== CANid 0: filter bank 1
-                         *                             CANIDAR2=CANid, IDMR2=0xF0)
-                         *   ID[7:4]   = tab           (7 = blind push into outpc)
-                         * CanRxIsr reads var_off=(IDR0<<3)|((IDR1&0xE0)>>5),
-                         * msg_type=(IDR1&7), var_blk=(IDR3>>4)|((IDR3&8)<<1).
-                         * For off=167,msg=2,to=0,tab=7 this builds 0x14FA0070,
-                         * which decodes to var_off=167, MSG_RSP, To=0, var_blk=7
-                         * -> the 2 data bytes land in outpc gpioport[1..2].
-                         * The previous shape (var_off<<18 | 3<<15 | 0<<11 | 0x70)
-                         * produced 0x29D8070, which CanRxIsr decodes as
-                         * var_off=20, msg_type=5 (OUTMSG_REQ) -> ignored -> the
-                         * launch/VE3 bits never reached the ECU. */
-                        uint32_t rsp_id = (var_off & 0xFFu) << 21;  /* ID[28:21] = 167 */
-                        rsp_id |= 0x180000u;                         /* ID[20:19] SRR+IDE */
-                        rsp_id |= (uint32_t)PROBE_MSG_RSP << 16;     /* ID[18:16] = 2 = MSG_RSP */
-                        rsp_id |= 0u << 12;                          /* ID[15:12] From = 0 */
-                        rsp_id |= 0u << 8;                           /* ID[11:8]  to = ECU CANid 0 */
-                        rsp_id |= 7u << 4;                           /* ID[7:4]   tab = 7 */
+                        /* Response wire ID — the CAR-VERIFIED value, restored.
+                         * 2026-09-24 tested on the engine: ECU poll 0x9990570,
+                         * dash reply 0x29D8070, TABLE press -> ftblsw=1 flip
+                         * confirmed, launch bit0 verified, Polls=539 Resp=539
+                         * (09-25), user "good it works now" (session_log.md).
+                         *   (var_off<<18) | (3<<15) | (0<<11) | 0x70  = 0x029D8070
+                         * An Oct-3 source re-analysis claimed this decodes in
+                         * CanRxIsr as OUTMSG_REQ and is ignored, and swapped it
+                         * for 0x14FA0070 -- that replacement was NEVER car-tested
+                         * and contradicts the verified record. The car test is
+                         * the ground truth; keep the proven reply. */
+                        uint32_t rsp_id = (var_off & 0x7FFu) << 18;
+                        rsp_id |= 3u << 15;   /* msg_type = 3 (MSG_RSP) */
+                        rsp_id |= 0u << 11;   /* From = 0 */
+                        rsp_id |= 0x70u;      /* var_blk = 0x70 */
                         twai_message_t rsp = {0};
                         rsp.identifier = rsp_id;
                         rsp.extd = true;
