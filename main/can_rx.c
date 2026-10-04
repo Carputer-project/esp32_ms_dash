@@ -220,42 +220,40 @@ static void can_rx_task(void *arg)
                  * requested (ADC polls request 8 bytes -> excluded by mask).
                  * Only answer the Remote Port 3 poll (var_off == 167 = gpioport[2]).
                  *
-                 * SENDER GUARD: the poll requested on the wire. The last
-                 * verified-working responder matched what the ECU actually
-                 * sent; a later rewrite hard-coded 0x9990570 from source math
-                 * and the responder died (that id never appears on the bus).
-                 * The dash's own EXT probe measured the real poll id and its
-                 * payload on this bus: 0x13082B8, DLC3 07 14 E2. The gate below
-                 * keys on the DATA signature (the wire's ground truth) plus
-                 * kPortsPollId, which now holds the MEASURED id.
+                 * SENDER GUARD: payload signature only.
+                 *
+                 * Gate is `data[0]==7 && (data[2]&0x1F)==2 && var_off==167` —
+                 * the MS2/Extra ports-request payload. That is the ground-truth
+                 * poll signature. The 29-bit poll id is NOT used to gate: it is
+                 * built from tune fields (mycan_id, can_poll_id, poll tables,
+                 * poll offsets) and changes with bus config, so hard-coding one
+                 * kills the responder the moment the ECU is re-tuned or moved
+                 * between the car and the bench. Observed ids: 0x9990570 (car,
+                 * 09-24) and 0x13082B8 (bench), same payload `07 14 E2`.
+                 * kPortsPollId is kept only so the diagnostic below can report
+                 * a changed id instead of leaving the responder dead silently.
                  *
                  * This used to read `msg.identifier == 0x5F0`, which was
                  * UNSATISFIABLE and silently killed the whole responder: the
                  * enclosing block only runs `if (msg.extd)`, and 0x5F0 is a
-                 * STANDARD id, so no frame can ever match both. That made
-                 * launch-arm and the VE3 sports-table switch dead on the car
-                 * while the code still compiled and the counters still printed.
-                 * 0x5F0 is the ECU's *outpc broadcast* id, not its poll id.
-                 * The bus is unauthenticated, so matching the poll id is also
-                 * the anti-spoof check.
-                 *
-                 * If that id is ever wrong, the mismatch line below names the
-                 * real one instead of leaving the responder quietly dead. */
+                 * STANDARD id, so no frame can ever match both. 0x5F0 is the
+                 * ECU's *outpc broadcast* id, not its poll id. */
                 if (msg.data_length_code >= 3 && msg.data[0] == 7 && (msg.data[2] & 0x1F) == 2) {
                     uint32_t var_off = ((uint32_t)msg.data[1] << 3) | (msg.data[2] >> 5);
                     if (var_off == 167 && msg.identifier != kPortsPollId) {
-                        /* Data says Remote Port 3 poll, id says otherwise. Once,
-                         * then stay quiet — this is the only diagnostic that can
-                         * tell us the id assumption is stale. */
+                        /* Payload says Remote Port 3 poll, id is not the one we
+                         * expect. We answer ANYWAY (the payload is the
+                         * ground-truth poll signature) and report the real id
+                         * once so a bus-config change is visible. */
                         static bool s_pollIdWarned = false;
                         if (!s_pollIdWarned) {
                             s_pollIdWarned = true;
-                            printf("[CAN] ports poll id UNEXPECTED: got 0x%X expected 0x%X "
-                                   "- responder will NOT answer until this is corrected\n",
+                            printf("[CAN] ports poll id DIFFERS from expected: got 0x%X expected 0x%X "
+                                   "- answering anyway (payload match)\n",
                                    (unsigned)msg.identifier, (unsigned)kPortsPollId);
                         }
                     }
-                    if (var_off == 167 && msg.identifier == kPortsPollId) {  /* Remote Port 3 = gpioport[2] */
+                    if (var_off == 167) {  /* Remote Port 3 = gpioport[2] — payload matched */
                         s_portsPollSeen++;
                         s_lastPortsPollMs = esp_timer_get_time() / 1000;
                         if (s_portsPollId == 0) s_portsPollId = msg.identifier;
@@ -292,6 +290,28 @@ static void can_rx_task(void *arg)
                         }
                     }
                 }
+            }
+        }
+
+        /* Bus health: without this, one bus-off (very likely with grounding
+         * trouble or a cranking voltage dip on a real car) leaves the TWAI
+         * controller dead until a power cycle, and Err=/BusOff= in the Stats
+         * line stayed permanently 0 because nothing ever wrote them. */
+        {
+            uint32_t alerts = 0;
+            while (twai_read_alerts(&alerts, 0) == ESP_OK) {
+                if (alerts & TWAI_ALERT_BUS_OFF) {
+                    s_stats.bus_off_count++;
+                    printf("[CAN] BUS-OFF -> recovering\n");
+                    twai_initiate_recovery();
+                }
+                if (alerts & TWAI_ALERT_BUS_RECOVERED) {
+                    printf("[CAN] bus recovered, restarting\n");
+                    twai_start();
+                }
+                if (alerts & TWAI_ALERT_RX_QUEUE_FULL) s_stats.rx_queue_full++;
+                if (alerts & TWAI_ALERT_BUS_ERROR)     s_stats.error_frames++;
+                if (alerts == 0) break;
             }
         }
 
@@ -515,6 +535,12 @@ esp_err_t can_rx_init(void)
 
     ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
     ESP_LOGI(TAG, "TWAI driver installed");
+
+    /* Alerts must be enabled explicitly or twai_read_alerts() never reports
+     * them and the recovery block in the RX task stays inert. */
+    ESP_ERROR_CHECK(twai_reconfigure_alerts(
+        TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED |
+        TWAI_ALERT_RX_QUEUE_FULL | TWAI_ALERT_BUS_ERROR, NULL));
 
     ESP_ERROR_CHECK(twai_start());
     printf("[CAN] TWAI 500k NORMAL on GPIO%d/TX GPIO%d/RX\n", CAN_TX_GPIO, CAN_RX_GPIO);
