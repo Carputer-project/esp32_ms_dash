@@ -267,11 +267,22 @@ static void can_rx_task(void *arg)
                          * CanRxIsr as OUTMSG_REQ and is ignored, and swapped it
                          * for 0x14FA0070 -- that replacement was NEVER car-tested
                          * and contradicts the verified record. The car test is
-                         * the ground truth; keep the proven reply. */
+                         * the ground truth; keep the proven reply.
+                         *
+                         * 2026-10-04: restored to the values GitHub actually has
+                         * (origin/main 6ede98a) -> reply 0x29D2838. Three separate
+                         * reply encodings have each been called "the working one":
+                         *   0x29D2838  this one  - msg_type 2, From 5, var_blk 0x38
+                         *   0x29D8070  09-24 note - msg_type 3, From 0, var_blk 0x70
+                         *   0x14FA0070 Oct-3 theory, never tested
+                         * The GitHub values are what was shipped and run, so they
+                         * are the ones under test now. CAR TEST DECIDES - do not
+                         * swap this again on reasoning alone. */
+                        /* Response wire ID: var_off=ID[28:18], msg_type=2, From=5, var_blk=7 */
                         uint32_t rsp_id = (var_off & 0x7FFu) << 18;
-                        rsp_id |= 3u << 15;   /* msg_type = 3 (MSG_RSP) */
-                        rsp_id |= 0u << 11;   /* From = 0 */
-                        rsp_id |= 0x70u;      /* var_blk = 0x70 */
+                        rsp_id |= ((uint32_t)PROBE_MSG_RSP & 0x7u) << 15;
+                        rsp_id |= 5u << 11;
+                        rsp_id |= 0x38u;
                         twai_message_t rsp = {0};
                         rsp.identifier = rsp_id;
                         rsp.extd = true;
