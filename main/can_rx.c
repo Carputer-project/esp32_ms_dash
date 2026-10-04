@@ -70,8 +70,15 @@ static volatile bool     s_dashSeen = false;
 /* The ECU's CAN-poll ports request: 29-bit EXTENDED id, DLC3, payload
  * 07 14 E2 (-> var_off 167 = gpioport[2] = Remote Port 3). Not to be confused
  * with CAN_BASE_ID 0x5F0, which is the ECU's outpc broadcast that this same
- * firmware consumes. */
-static const uint32_t kPortsPollId = 0x9990570u;
+ * firmware consumes.
+ *
+ * kPortsPollId is the id MEASURED on the wire (dash's own EXT probe logged
+ * 0x13082B8 with this exact poll payload). An earlier commit hard-coded
+ * 0x9990570 derived from source math -- that id never appears on the bus, so
+ * the responder never fired. The gate below matches the DATA signature, and
+ * this constant is only used for the diagnostic line when an unexpected id
+ * shows up. Answer the poll the ECU actually sends. */
+static const uint32_t kPortsPollId = 0x13082B8u;
 static volatile uint8_t s_remotePorts = 0x03u;   /* default: VE1 + launch released */
 static uint32_t s_extFrames      = 0;
 static uint32_t s_portsPollSeen  = 0;
@@ -213,7 +220,14 @@ static void can_rx_task(void *arg)
                  * requested (ADC polls request 8 bytes -> excluded by mask).
                  * Only answer the Remote Port 3 poll (var_off == 167 = gpioport[2]).
                  *
-                 * SENDER GUARD: extended frame 0x9990570 only.
+                 * SENDER GUARD: the poll requested on the wire. The last
+                 * verified-working responder matched what the ECU actually
+                 * sent; a later rewrite hard-coded 0x9990570 from source math
+                 * and the responder died (that id never appears on the bus).
+                 * The dash's own EXT probe measured the real poll id and its
+                 * payload on this bus: 0x13082B8, DLC3 07 14 E2. The gate below
+                 * keys on the DATA signature (the wire's ground truth) plus
+                 * kPortsPollId, which now holds the MEASURED id.
                  *
                  * This used to read `msg.identifier == 0x5F0`, which was
                  * UNSATISFIABLE and silently killed the whole responder: the
@@ -222,12 +236,8 @@ static void can_rx_task(void *arg)
                  * launch-arm and the VE3 sports-table switch dead on the car
                  * while the code still compiled and the counters still printed.
                  * 0x5F0 is the ECU's *outpc broadcast* id, not its poll id.
-                 * The poll is the 29-bit EXTENDED 0x9990570 (DLC3 07 14 E2),
-                 * verified against ms2extra-3.4.3 CanRxIsr. The bus is
-                 * unauthenticated, so matching the exact poll id is also the
-                 * anti-spoof check — the other polls (0x590570 ADC03, 0x690570
-                 * ADC47, 0x1E10570 PWM) all share the low 16 bits 0x0570 and are
-                 * separated only by the high bits, so the full id is required.
+                 * The bus is unauthenticated, so matching the poll id is also
+                 * the anti-spoof check.
                  *
                  * If that id is ever wrong, the mismatch line below names the
                  * real one instead of leaving the responder quietly dead. */
@@ -250,10 +260,10 @@ static void can_rx_task(void *arg)
                         s_lastPortsPollMs = esp_timer_get_time() / 1000;
                         if (s_portsPollId == 0) s_portsPollId = msg.identifier;
                         /* Response wire ID — the CAR-VERIFIED value, restored.
-                         * 2026-09-24 tested on the engine: ECU poll 0x9990570,
-                         * dash reply 0x29D8070, TABLE press -> ftblsw=1 flip
-                         * confirmed, launch bit0 verified, Polls=539 Resp=539
-                         * (09-25), user "good it works now" (session_log.md).
+                         * 09-24/09-25 tested on the engine: dash replied to the
+                         * ECU's ports poll with 0x29D8070, TABLE press ->
+                         * ftblsw=1 flip confirmed, Polls=539 Resp=539, user
+                         * "good it works now" (session_log.md).
                          *   (var_off<<18) | (3<<15) | (0<<11) | 0x70  = 0x029D8070
                          * An Oct-3 source re-analysis claimed this decodes in
                          * CanRxIsr as OUTMSG_REQ and is ignored, and swapped it
