@@ -67,6 +67,11 @@ static volatile bool     s_dashSeen = false;
  * bit0 CLEARED = launch active (active-low, mirrors pulled-up physical input).
  * ECU polls every 10ms; launch indicator requires fresh polls (<100ms). */
 #define PROBE_MSG_RSP 2u
+/* The ECU's CAN-poll ports request: 29-bit EXTENDED id, DLC3, payload
+ * 07 14 E2 (-> var_off 167 = gpioport[2] = Remote Port 3). Not to be confused
+ * with CAN_BASE_ID 0x5F0, which is the ECU's outpc broadcast that this same
+ * firmware consumes. */
+static const uint32_t kPortsPollId = 0x9990570u;
 static volatile uint8_t s_remotePorts = 0x03u;   /* default: VE1 + launch released */
 static uint32_t s_extFrames      = 0;
 static uint32_t s_portsPollSeen  = 0;
@@ -206,12 +211,40 @@ static void can_rx_task(void *arg)
                 /* MS2/Extra ports poll request: MSG_REQ, reply-to table 7, 2 bytes
                  * requested (ADC polls request 8 bytes -> excluded by mask).
                  * Only answer the Remote Port 3 poll (var_off == 167 = gpioport[2]).
-                 * Sender must be the ECU (standard ID 0x5F0) — the bus is
-                 * unauthenticated, so any node could spoof the poll. */
-                if (msg.data_length_code >= 3 && msg.data[0] == 7 && (msg.data[2] & 0x1F) == 2
-                    && msg.identifier == 0x5F0) {
+                 *
+                 * SENDER GUARD: extended frame 0x9990570 only.
+                 *
+                 * This used to read `msg.identifier == 0x5F0`, which was
+                 * UNSATISFIABLE and silently killed the whole responder: the
+                 * enclosing block only runs `if (msg.extd)`, and 0x5F0 is a
+                 * STANDARD id, so no frame can ever match both. That made
+                 * launch-arm and the VE3 sports-table switch dead on the car
+                 * while the code still compiled and the counters still printed.
+                 * 0x5F0 is the ECU's *outpc broadcast* id, not its poll id.
+                 * The poll is the 29-bit EXTENDED 0x9990570 (DLC3 07 14 E2),
+                 * verified against ms2extra-3.4.3 CanRxIsr. The bus is
+                 * unauthenticated, so matching the exact poll id is also the
+                 * anti-spoof check — the other polls (0x590570 ADC03, 0x690570
+                 * ADC47, 0x1E10570 PWM) all share the low 16 bits 0x0570 and are
+                 * separated only by the high bits, so the full id is required.
+                 *
+                 * If that id is ever wrong, the mismatch line below names the
+                 * real one instead of leaving the responder quietly dead. */
+                if (msg.data_length_code >= 3 && msg.data[0] == 7 && (msg.data[2] & 0x1F) == 2) {
                     uint32_t var_off = ((uint32_t)msg.data[1] << 3) | (msg.data[2] >> 5);
-                    if (var_off == 167) {  /* Remote Port 3 = gpioport[2] */
+                    if (var_off == 167 && msg.identifier != kPortsPollId) {
+                        /* Data says Remote Port 3 poll, id says otherwise. Once,
+                         * then stay quiet — this is the only diagnostic that can
+                         * tell us the id assumption is stale. */
+                        static bool s_pollIdWarned = false;
+                        if (!s_pollIdWarned) {
+                            s_pollIdWarned = true;
+                            printf("[CAN] ports poll id UNEXPECTED: got 0x%X expected 0x%X "
+                                   "- responder will NOT answer until this is corrected\n",
+                                   (unsigned)msg.identifier, (unsigned)kPortsPollId);
+                        }
+                    }
+                    if (var_off == 167 && msg.identifier == kPortsPollId) {  /* Remote Port 3 = gpioport[2] */
                         s_portsPollSeen++;
                         s_lastPortsPollMs = esp_timer_get_time() / 1000;
                         if (s_portsPollId == 0) s_portsPollId = msg.identifier;
