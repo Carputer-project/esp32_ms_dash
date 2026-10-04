@@ -46,7 +46,10 @@ typedef struct {
     uint8_t  iacMode;      // 0=man, 1=auto, 2=follow (from iobox3 0xB0)
     bool     buzzerOn;     // from iobox3 0xB0
     uint8_t  speedMph;     // from iobox3 0xB0 f[2] (ABS/LM393 input)
-    bool     launchActive; // from ECU CAN-poll ports response (0x29D8070 bit0, active-low)
+    bool     launchActive; // ECU says launch is ENGAGED: status2 bit3, broadcast group 10 byte 1
+    bool     launchArmed;  // dash-side intent: LAUNCH ARM pressed AND ECU polled us recently
+                           // (bit0 of the ports-response byte cleared, active-low). This is
+                           // what the button highlights — the button shows intent, not outcome.
     uint8_t  syncLossReason; // ECU lost sync reason code (0=none, 2=missing tooth, 11=cam/crank, etc.)
     uint32_t lastRxMs;
     uint32_t lastSdbMs;

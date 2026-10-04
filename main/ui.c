@@ -160,8 +160,7 @@ static bool s_ovr_latch;
 static lv_obj_t *s_val_lbl;
 static lv_obj_t *s_can_lbl;
 static lv_obj_t *s_mat_lbl;
-static lv_obj_t *s_tbl_lbl, *s_adv_lbl, *s_rlim_lbl, *s_launch_lbl, *s_sync_lbl;
-static bool s_rlim_vis;
+static lv_obj_t *s_tbl_lbl, *s_adv_lbl, *s_launch_lbl, *s_sync_lbl;
 static lv_obj_t *s_iobox_lbl;
 static lv_obj_t *s_speed_val, *s_speed_unit;
 static bool s_speed_unit_seen;
@@ -1212,19 +1211,16 @@ static void ui_init_main_build(void) {
     lv_obj_set_style_text_font(s_adv_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_pos(s_adv_lbl, 540, 8);
 
-    /* REV LIM chip — shows while the ECU's soft/hard rev limiter is retarding
-     * spark (status3 bit5). Blinks like the latched indicator lamps. */
-    s_rlim_lbl = lv_label_create(s_scr_main);
-    lv_label_set_text(s_rlim_lbl, "REV LIM");
-    lv_obj_set_style_text_color(s_rlim_lbl, lv_color_hex(0x0A0A10), 0);
-    lv_obj_set_style_bg_color(s_rlim_lbl, lv_color_hex(COL_BAD), 0);
-    lv_obj_set_style_bg_opa(s_rlim_lbl, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_rlim_lbl, 3, 0);
-    lv_obj_set_style_pad_ver(s_rlim_lbl, 2, 0);
-    lv_obj_set_style_pad_hor(s_rlim_lbl, 6, 0);
-    lv_obj_set_style_text_font(s_rlim_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(s_rlim_lbl, 100, 8);
-    lv_obj_add_flag(s_rlim_lbl, LV_OBJ_FLAG_HIDDEN);
+    /* REV LIM chip REMOVED 2026-10-04 (user). Two reasons, both real:
+     *  1. It was never requested, and the car already shows rev limiting in the
+     *     main gauge (needle/redline), so it was a duplicate indicator.
+     *  2. It was mis-wired: it read outpc byte 80 bit 5 believing it was
+     *     status3, but the 0x5F0 broadcast re-arranges the status fields, and
+     *     byte 80 is actually status1 -- whose bit 5 is ftblsw. So the chip
+     *     blinked in step with the fuel-table switch instead of the limiter.
+     *     That mis-wiring is fixed in can_rx.c regardless (status1/status3 now
+     *     read from broadcast group 10), but nothing displays revLimOn now.
+     */
 
     /* iobox3 link-health chip (top-left): BOX OK when the ESP-NOW link is
      * alive, BOX LOST when the box goes silent. CAN can be fine while the box
@@ -1701,16 +1697,19 @@ static void iac_man_evt(lv_event_t *e) {
     can_tx_iac_manual((uint8_t)s_iac_duty_val);
 }
 
-/* Launch arm / table switch highlight — truth from ECU's own data:
- * launchActive = dash armed AND ECU polling us (poll <100ms)
- * fuelTable == 3 = ECU's ftblsw bit set (VE3 active)
- * Both gated on CAN stream health (s_can_ok). CAN-only since
- * 2026-09-25 (iobox O2/O3 paths + source switcher removed).
+/* Launch arm / table switch highlight.
+ * The LAUNCH ARM button shows INTENT (launchArmed: pressed, and the ECU is
+ * polling us so the bit is actually being delivered) -- not the ECU's outcome.
+ * The top-strip LAUNCH lamp shows TRUTH (launchActive: the ECU's own
+ * status2 bit 3), so "armed" and "actually launching" can never be confused
+ * for each other. fuelTable == 3 is likewise the ECU's ftblsw bit.
+ * All three gated on CAN stream health (s_can_ok). CAN-only since 2026-09-25
+ * (iobox O2/O3 paths + source switcher removed).
  * Pass d = current frame data; if NULL, uses s_prev (last frame). */
 static void update_launch_table(const dash_data_t *d) {
     if (!s_main_launch || !s_main_table) return;
     if (!d) d = &s_prev;
-    bool l_on = d->launchActive;
+    bool l_on = d->launchArmed;
     bool t_on = (d->fuelTable == 3);
     if (!s_can_ok) { l_on = false; t_on = false; }
     /* Re-style on an actual change (called every frame) OR when the accent
@@ -2726,7 +2725,9 @@ void ui_update(const dash_data_t *d) {
     if (strcmp(lv_label_get_text(s_tbl_lbl), buf) != 0)
         lv_label_set_text(s_tbl_lbl, buf);
 
-    /* launch indicator (active-low from CAN-poll ports response bit0) */
+    /* LAUNCH lamp = ECU TRUTH: status2 bit 3 from broadcast group 10. Only lights
+     * when the ECU has actually engaged launch (needs launch_tps=70% and RPM in the
+     * launch window), so it stays dark at idle even when the button is armed. */
     if (ok && d->launchActive) {
         lv_obj_set_style_text_color(s_launch_lbl, lv_color_hex(COL_GOOD), 0);
     } else {
@@ -2743,13 +2744,9 @@ void ui_update(const dash_data_t *d) {
     if (strcmp(lv_label_get_text(s_adv_lbl), buf) != 0)
         lv_label_set_text(s_adv_lbl, buf);
 
-    /* REV LIM chip: blink while the ECU is rev-limiting (phase-gated). */
-    bool rlim = ok && d->revLimOn && ((lv_tick_get() / 350) & 1);
-    if (rlim != s_rlim_vis) {
-        s_rlim_vis = rlim;
-        if (rlim) lv_obj_remove_flag(s_rlim_lbl, LV_OBJ_FLAG_HIDDEN);
-        else      lv_obj_add_flag(s_rlim_lbl, LV_OBJ_FLAG_HIDDEN);
-    }
+    /* REV LIM chip removed with its widget -- see the build note at the old
+     * creation site. d->revLimOn is still decoded correctly in can_rx.c but
+     * nothing displays it; rev limiting is visible in the main gauge. */
 
     /* SYNC LOSS reason: show ECU lost sync reason code (0=none, 2=missing tooth, 11=cam/crank, etc.) */
     if (ok && d->syncLossReason > 0) {

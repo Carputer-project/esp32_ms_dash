@@ -5,8 +5,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "freertos/idf_additions.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/twai.h"
@@ -67,23 +65,10 @@ static volatile bool     s_dashSeen = false;
  * bit0 CLEARED = launch active (active-low, mirrors pulled-up physical input).
  * ECU polls every 10ms; launch indicator requires fresh polls (<100ms). */
 #define PROBE_MSG_RSP 2u
-/* The ECU's CAN-poll ports request: 29-bit EXTENDED id, DLC3, payload
- * 07 14 E2 (-> var_off 167 = gpioport[2] = Remote Port 3). Not to be confused
- * with CAN_BASE_ID 0x5F0, which is the ECU's outpc broadcast that this same
- * firmware consumes.
- *
- * kPortsPollId is the id MEASURED on the wire (dash's own EXT probe logged
- * 0x13082B8 with this exact poll payload). An earlier commit hard-coded
- * 0x9990570 derived from source math -- that id never appears on the bus, so
- * the responder never fired. The gate below matches the DATA signature, and
- * this constant is only used for the diagnostic line when an unexpected id
- * shows up. Answer the poll the ECU actually sends. */
-static const uint32_t kPortsPollId = 0x13082B8u;
 static volatile uint8_t s_remotePorts = 0x03u;   /* default: VE1 + launch released */
 static uint32_t s_extFrames      = 0;
 static uint32_t s_portsPollSeen  = 0;
 static uint32_t s_portsRespSent  = 0;
-static uint32_t s_txFailSeen     = 0;   /* twai_transmit() refused the reply */
 static uint32_t s_portsPollId    = 0;      /* wire ID of the ECU's ports poll */
 static uint32_t s_rspId          = 0;      /* wire ID we transmit back */
 static uint32_t s_lastPortsPollMs = 0;     /* when ECU last polled Remote Port 3 */
@@ -218,66 +203,13 @@ static void can_rx_task(void *arg)
 
                 /* MS2/Extra ports poll request: MSG_REQ, reply-to table 7, 2 bytes
                  * requested (ADC polls request 8 bytes -> excluded by mask).
-                 * Only answer the Remote Port 3 poll (var_off == 167 = gpioport[2]).
-                 *
-                 * SENDER GUARD: payload signature only.
-                 *
-                 * Gate is `data[0]==7 && (data[2]&0x1F)==2 && var_off==167` —
-                 * the MS2/Extra ports-request payload. That is the ground-truth
-                 * poll signature. The 29-bit poll id is NOT used to gate: it is
-                 * built from tune fields (mycan_id, can_poll_id, poll tables,
-                 * poll offsets) and changes with bus config, so hard-coding one
-                 * kills the responder the moment the ECU is re-tuned or moved
-                 * between the car and the bench. Observed ids: 0x9990570 (car,
-                 * 09-24) and 0x13082B8 (bench), same payload `07 14 E2`.
-                 * kPortsPollId is kept only so the diagnostic below can report
-                 * a changed id instead of leaving the responder dead silently.
-                 *
-                 * This used to read `msg.identifier == 0x5F0`, which was
-                 * UNSATISFIABLE and silently killed the whole responder: the
-                 * enclosing block only runs `if (msg.extd)`, and 0x5F0 is a
-                 * STANDARD id, so no frame can ever match both. 0x5F0 is the
-                 * ECU's *outpc broadcast* id, not its poll id. */
+                 * Only answer the Remote Port 3 poll (var_off == 167 = gpioport[2]). */
                 if (msg.data_length_code >= 3 && msg.data[0] == 7 && (msg.data[2] & 0x1F) == 2) {
                     uint32_t var_off = ((uint32_t)msg.data[1] << 3) | (msg.data[2] >> 5);
-                    if (var_off == 167 && msg.identifier != kPortsPollId) {
-                        /* Payload says Remote Port 3 poll, id is not the one we
-                         * expect. We answer ANYWAY (the payload is the
-                         * ground-truth poll signature) and report the real id
-                         * once so a bus-config change is visible. */
-                        static bool s_pollIdWarned = false;
-                        if (!s_pollIdWarned) {
-                            s_pollIdWarned = true;
-                            printf("[CAN] ports poll id DIFFERS from expected: got 0x%X expected 0x%X "
-                                   "- answering anyway (payload match)\n",
-                                   (unsigned)msg.identifier, (unsigned)kPortsPollId);
-                        }
-                    }
-                    if (var_off == 167) {  /* Remote Port 3 = gpioport[2] — payload matched */
+                    if (var_off == 167) {  /* Remote Port 3 = gpioport[2] */
                         s_portsPollSeen++;
                         s_lastPortsPollMs = esp_timer_get_time() / 1000;
                         if (s_portsPollId == 0) s_portsPollId = msg.identifier;
-                        /* Response wire ID — the CAR-VERIFIED value, restored.
-                         * 09-24/09-25 tested on the engine: dash replied to the
-                         * ECU's ports poll with 0x29D8070, TABLE press ->
-                         * ftblsw=1 flip confirmed, Polls=539 Resp=539, user
-                         * "good it works now" (session_log.md).
-                         *   (var_off<<18) | (3<<15) | (0<<11) | 0x70  = 0x029D8070
-                         * An Oct-3 source re-analysis claimed this decodes in
-                         * CanRxIsr as OUTMSG_REQ and is ignored, and swapped it
-                         * for 0x14FA0070 -- that replacement was NEVER car-tested
-                         * and contradicts the verified record. The car test is
-                         * the ground truth; keep the proven reply.
-                         *
-                         * 2026-10-04: restored to the values GitHub actually has
-                         * (origin/main 6ede98a) -> reply 0x29D2838. Three separate
-                         * reply encodings have each been called "the working one":
-                         *   0x29D2838  this one  - msg_type 2, From 5, var_blk 0x38
-                         *   0x29D8070  09-24 note - msg_type 3, From 0, var_blk 0x70
-                         *   0x14FA0070 Oct-3 theory, never tested
-                         * The GitHub values are what was shipped and run, so they
-                         * are the ones under test now. CAR TEST DECIDES - do not
-                         * swap this again on reasoning alone. */
                         /* Response wire ID: var_off=ID[28:18], msg_type=2, From=5, var_blk=7 */
                         uint32_t rsp_id = (var_off & 0x7FFu) << 18;
                         rsp_id |= ((uint32_t)PROBE_MSG_RSP & 0x7u) << 15;
@@ -292,37 +224,9 @@ static void can_rx_task(void *arg)
                         if (twai_transmit(&rsp, pdMS_TO_TICKS(10)) == ESP_OK) {
                             s_portsRespSent++;
                             s_rspId = rsp_id;
-                        } else {
-                            /* Silent failure is the other half of the problem:
-                             * the responder could be firing every 10 ms and
-                             * transmitting nothing, and Resp= would just stay
-                             * at 0 looking identical to "never polled". */
-                            s_txFailSeen++;
                         }
                     }
                 }
-            }
-        }
-
-        /* Bus health: without this, one bus-off (very likely with grounding
-         * trouble or a cranking voltage dip on a real car) leaves the TWAI
-         * controller dead until a power cycle, and Err=/BusOff= in the Stats
-         * line stayed permanently 0 because nothing ever wrote them. */
-        {
-            uint32_t alerts = 0;
-            while (twai_read_alerts(&alerts, 0) == ESP_OK) {
-                if (alerts & TWAI_ALERT_BUS_OFF) {
-                    s_stats.bus_off_count++;
-                    printf("[CAN] BUS-OFF -> recovering\n");
-                    twai_initiate_recovery();
-                }
-                if (alerts & TWAI_ALERT_BUS_RECOVERED) {
-                    printf("[CAN] bus recovered, restarting\n");
-                    twai_start();
-                }
-                if (alerts & TWAI_ALERT_RX_QUEUE_FULL) s_stats.rx_queue_full++;
-                if (alerts & TWAI_ALERT_BUS_ERROR)     s_stats.error_frames++;
-                if (alerts == 0) break;
             }
         }
 
@@ -334,40 +238,10 @@ static void can_rx_task(void *arg)
             s_stats.last_sec_frame_count = s_stats.total_frames;
             s_stats.last_sec_time_ms = now_ms;
             printf("[CAN] Stats: FPS=%" PRIu32 " Total=%" PRIu32 " Err=%" PRIu32 " BusOff=%" PRIu32
-                   " Ext=%" PRIu32 " Polls=%" PRIu32 " Resp=%" PRIu32 " txfail=%" PRIu32 " Spd=%" PRIu32 "\n",
+                   " Ext=%" PRIu32 " Polls=%" PRIu32 " Resp=%" PRIu32 "\n",
                      fps, s_stats.total_frames,
                      s_stats.error_frames, s_stats.bus_off_count,
-                     s_extFrames, s_portsPollSeen, s_portsRespSent, s_txFailSeen,
-                      (uint32_t)can_rx_get_speed());
-            /* Diagnostics only - the wire format above is unchanged.
-             *
-             * The counters alone cannot separate the three states this can be
-             * in, and that is why it stayed broken across three rounds:
-             *   Ext>0, Polls=0  -> the ECU is on the bus but is NOT asking for
-             *                       the remote ports. Not a dash problem.
-             *   Polls>0, Resp=0 -> twai_transmit() is failing. Transceiver or
-             *                       bus. txfail says so explicitly.
-             *   Polls>0, Resp>0 -> the dash is answering correctly and the bits
-             *                       are not landing. Then it is the ECU side.
-             * Report the first two once; the third is already obvious. */
-            static bool s_noPollWarned = false, s_txFailWarned = false, s_pollOkWarned = false;
-            if (s_extFrames > 20 && s_portsPollSeen == 0 && !s_noPollWarned) {
-                s_noPollWarned = true;
-                printf("[CAN] DIAG: %" PRIu32 " extended frames, ZERO ports polls. The ECU is "
-                       "transmitting but never requests the remote ports, so the dash "
-                       "cannot answer. Not a dash-side fault.\n", s_extFrames);
-            }
-            if (s_txFailSeen && !s_txFailWarned) {
-                s_txFailWarned = true;
-                printf("[CAN] DIAG: %" PRIu32 " ports replies FAILED to transmit (no ACK / "
-                       "bus error). The responder is firing but nothing is reaching the "
-                       "wire - transceiver, its enable, or termination.\n", s_txFailSeen);
-            }
-            if (s_portsPollSeen > 0 && !s_pollOkWarned) {
-                s_pollOkWarned = true;
-                printf("[CAN] DIAG: ports poll live, replying id=0x%X var_off=167 DLC=2 "
-                       "(steady 00 03).\n", (unsigned)s_rspId);
-            }
+                     s_extFrames, s_portsPollSeen, s_portsRespSent);
         }
 
         // Print TWAI status every 10 seconds
@@ -433,39 +307,64 @@ static void can_rx_task(void *arg)
             /* Spark table + rev-lim from gp10 status bytes, live timing from
              * gp01 (adv_deg @8). status1 bit6 stblsw = 3rd spark table active
              * (T3); status3 bit5 REVLIMSFT = soft/hard rev limiter engaged. */
-            /* Table select + rev limiter. Offsets verified against
-             * megasquirt2.ini [OutputChannels] lines 5383-5387:
-             *   status1  = U08, 78   status3 = U08, 80   looptime = U16, 82
-             * and [Indicator] lines 5120/5121/5135:
-             *   { status1 & 32 } = "Fuel Tbl sw"  (ftblsw, VE select)
-             *   { status1 & 64 } = "Spk Tbl sw"   (stblsw)
-             *   { status3 & 32 } = "No soft limit"/"Soft limiter"
-             * Broadcast group N covers bytes N*8..N*8+7, so status1@78 is in
-             * group 9 and status3@80 is in group 10 -- they are NOT the same
-             * group and must be gated separately. Previously all three reads
-             * used byte 80/82 gated on group 10, which meant the VE indicator
-             * was driven by the rev limiter and revLimOn by the loop timer. */
-            bool ftSeen = s_seen[9];    /* status1 @78 -> group 9  (bytes 72-79) */
-            bool stSeen = s_seen[10];   /* status3 @80 -> group 10 (bytes 80-87) */
-            s_data.fuelTable = (fresh && ftSeen) ? ((s_outpc[78] & 0x20) ? 3 : 1) : 0;
-            s_data.revLimOn  = (fresh && stSeen) && (s_outpc[80] & 0x20);
-            /* Launch active only if: dash armed (bit0 cleared) AND ECU is polling us
-             * (poll seen within 100ms). If polls stop, ECU holds last value but we
-             * don't know it -> show inactive for safety. */
+            /* Table select + rev limiter.
+             *
+             * The 0x5F0 broadcast is NOT raw outpc offsets. The ECU re-arranges
+             * the fields onto 8-byte boundaries (ms2_extra_can.c can_bcast_outpc,
+             * comment: "originally this data is not aligned with outpc, it is
+             * re-arranged for more logic 8 byte boundaries"). Its gp10 branch is:
+             *     data[0] = outpc.status1;  data[1] = status2;
+             *     data[2] = outpc.status3;  data[3] = status4;
+             * so on the wire status1 is group 10 byte 0 and status3 is group 10
+             * byte 2 -- NOT the [OutputChannels] offsets 78/80.
+             *
+             * Reading raw offsets instead is what broke the VE indicator: byte 78
+             * is group 9 data that never changes, so fuelTable was permanently 1,
+             * and byte 80 is status1, whose bit 5 is ftblsw -- so the "REV LIM"
+             * chip blinked in step with the fuel-table switch. Symptom the user
+             * reported: SPORTS MODE worked in TunerStudio, the VE3 top indicator
+             * never lit, the SPORTS MODE button never highlighted, and the
+             * rev-limiter chip flashed when SPORTS MODE was pressed.
+             *
+             * Bit meanings (megasquirt2.ini [Indicator] 5120/5121):
+             *   { status1 & 32 } = "Fuel Tbl sw" (ftblsw, VE select)
+             *   { status1 & 64 } = "Spk Tbl sw"  (stblsw)
+             *   { status3 & 32 } = "Soft limiter"
+             */
+            bool stSeen = s_seen[10];   /* status bytes live in broadcast group 10 */
+            uint8_t status1 = s_outpc[80];  /* gp10 data[0] */
+            uint8_t status2 = s_outpc[81];  /* gp10 data[1] */
+            uint8_t status3 = s_outpc[82];  /* gp10 data[2] */
+            s_data.fuelTable = (fresh && stSeen) ? ((status1 & 0x20) ? 3 : 1) : 0;
+            s_data.fuelTbl   = (fresh && stSeen) ? ((status1 & 0x20) ? 3 : 1) : 0;
+            s_data.revLimOn  = (fresh && stSeen) && (status3 & 0x20);
+            /* Launch, split into two different questions so a local flag is never
+             * dressed up as ECU state (the same trap that made the REV LIM chip
+             * blink with the fuel-table switch):
+             *   launchActive = ECU says launch is ENGAGED  -> status2 bit 3
+             *                   (megasquirt2.ini [Indicator] 5125:
+             *                    indicator = { status2 & 8}, "Launch")
+             *   launchArmed  = we asked for it: button pressed (bit0 of the
+             *                   ports-response byte cleared, active-low) AND the
+             *                   ECU polled us within 100ms. If polls stop the ECU
+             *                   holds its last value but we cannot know it, so the
+             *                   button drops back rather than claiming launch. */
             bool portsFresh = (now_ms - s_lastPortsPollMs) < 100;
-            s_data.launchActive = portsFresh && ((s_remotePorts & 0x01) == 0);
+            s_data.launchActive = (fresh && stSeen) && (status2 & 0x08);
+            s_data.launchArmed  = portsFresh && ((s_remotePorts & 0x01) == 0);
             s_data.probePolls = s_portsPollSeen;
             s_data.probeResp  = s_portsRespSent;
             s_data.probeReqId = s_portsPollId;
             s_data.probeRspId = s_rspId;
 
             /* Print status1 bit transitions: bit5 ftblsw (fuel table switch, the
-             * TRUTH for VE) and bit6 stblsw (spark). status1 is byte 78. */
+             * TRUTH for VE) and bit6 stblsw (spark). status1 is broadcast group 10
+             * byte 0 -- see the re-arrangement note above. */
             static uint8_t s_lastSt1 = 0xFF;
-            if (fresh && ftSeen && s_outpc[78] != s_lastSt1) {
-                s_lastSt1 = s_outpc[78];
-                printf("[CAN] status1=0x%02X ftblsw=%d stblsw=%d\n", s_outpc[78],
-                       (s_outpc[78] & 0x20) ? 1 : 0, (s_outpc[78] & 0x40) ? 1 : 0);
+            if (fresh && stSeen && status1 != s_lastSt1) {
+                s_lastSt1 = status1;
+                printf("[CAN] status1=0x%02X ftblsw=%d stblsw=%d\n", status1,
+                       (status1 & 0x20) ? 1 : 0, (status1 & 0x40) ? 1 : 0);
             }
 
             bool advSeen = s_seen[1];
@@ -476,10 +375,17 @@ static void can_rx_task(void *arg)
              * open-loop, so the marker stays off until the user flips to CL. */
             bool tgSeen = s_seen[17];
             s_data.bstTargKpa = (fresh && tgSeen) ? (rdS16(136) / 10) : 0;
-            /* SYNC LOSS reason: NOT decoded. gp43 (bytes 344-347) is outside
-             * CAN_RX_GROUPS=18 (max byte 143). Decoding needs CAN_RX_GROUPS >= 44
-             * (~208 more bytes of RX buffer). Field kept for struct compatibility;
-             * UI label stays hidden. */
+            /* SYNC LOSS reason: NOT decoded. Byte 139 was being read as
+             * outpc.syncreason, but per the INI Broadcast-2 dialog line 2568
+             * gp17 is boost_targ1,boostduty1,MAFv -- bytes 139-142 are the
+             * MAFv float32, so that read returned a float mantissa byte and lit
+             * a meaningless "SYNC nnn" almost continuously. synccnt/reason/
+             * timing_err are Broadcast-2 gp43 (INI line 2577) = bytes 344-347,
+             * which is outside CAN_RX_GROUPS=18 (max byte 143) and is not
+             * captured at all. Decoding it properly needs CAN_RX_GROUPS >= 44,
+             * which is ~208 more bytes of RX buffer -- decide against the
+             * partition headroom before attempting. Until then report 0 so the
+             * UI hides the label rather than showing noise. */
             s_data.syncLossReason = 0;
 
             s_data.canOk = fresh || sdbFresh;
@@ -547,12 +453,6 @@ esp_err_t can_rx_init(void)
     ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
     ESP_LOGI(TAG, "TWAI driver installed");
 
-    /* Alerts must be enabled explicitly or twai_read_alerts() never reports
-     * them and the recovery block in the RX task stays inert. */
-    ESP_ERROR_CHECK(twai_reconfigure_alerts(
-        TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED |
-        TWAI_ALERT_RX_QUEUE_FULL | TWAI_ALERT_BUS_ERROR, NULL));
-
     ESP_ERROR_CHECK(twai_start());
     printf("[CAN] TWAI 500k NORMAL on GPIO%d/TX GPIO%d/RX\n", CAN_TX_GPIO, CAN_RX_GPIO);
 
@@ -568,9 +468,9 @@ esp_err_t can_rx_init(void)
      * customer's car. It existed only as a bench "is the bus wired?" check;
      * the serial-command path can_rx_selftest_tx() covers that case properly. */
 
-    BaseType_t xret = xTaskCreatePinnedToCoreWithCaps(
+    BaseType_t xret = xTaskCreatePinnedToCore(
         can_rx_task, "can_rx", CAN_RX_TASK_STACK, NULL,
-        CAN_RX_TASK_PRIO, NULL, CAN_RX_TASK_CORE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        CAN_RX_TASK_PRIO, NULL, CAN_RX_TASK_CORE);
     if (xret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create CAN RX task");
         return ESP_FAIL;
