@@ -68,50 +68,18 @@ static volatile bool     s_dashSeen = false;
  * ECU polls every 10ms; launch indicator requires fresh polls (<100ms). */
 #define PROBE_MSG_RSP 2u
 /* The ECU's CAN-poll ports request: 29-bit EXTENDED id, DLC3, payload
- * 07 14 E2. Not to be confused with CAN_BASE_ID 0x5F0, which is the ECU's
- * outpc broadcast that this same firmware consumes.
- *
- * WHICH OFFSET IS NOT A CONSTANT - it is whatever the tune asks for, and the
- * two things that used to be hardcoded here were both wrong:
- *
- *   var_off:  megasquirt2.ini (ms2extra 3.4.4) [OutputChannels] gives
- *     gpioport0 = 166, gpioport1 = 167, gpioport2 = 168.
- *     The tune binds ts_port_f and launch_opt_pins to "Remote Port3 Bit
- *     0/1", and Remote Port 3 is gpioport2 = 168. This file tested
- *     `var_off == 167` and called it "gpioport[2]" in the comment - 167 is
- *     gpioport1, i.e. Remote Port 2. So the reply carried the launch and VE3
- *     bits one port to the LEFT of where the tune reads them, and both
- *     features stayed dead no matter how many times the reply was sent.
- *     Fixed by answering whichever member of the block is polled and placing
- *     each byte at its own offset - see kGpioPortOff/answerPortsPoll().
- *
- *   the id:    kept as the anti-spoof check the other polls require (they all
- *     share the low 16 bits 0x0570), but a poll whose id differs is now
- *     REPORTED rather than dropped in silence. Three of the four documented
- *     behaviours in this file were "print a counter and hope" - the counter
- *     cannot distinguish "ECU never polled" from "we answered and it did not
- *     land", which is the whole question.
- *
- * poll_offsetports in the tune is a separate per-frame base and does not
- * reconcile with 166-168 by inspection, so nothing here is inferred from it. */
+ * 07 14 E2 (-> var_off 167 = gpioport[2] = Remote Port 3). Not to be confused
+ * with CAN_BASE_ID 0x5F0, which is the ECU's outpc broadcast that this same
+ * firmware consumes. */
 static const uint32_t kPortsPollId = 0x9990570u;
-static const uint16_t kGpioPortOff0 = 166;    /* gpioport0, INI [OutputChannels] */
-static const uint16_t kGpioPortOffN = 3;      /* gpioport0/1/2 */
-
-/* Active-low: a cleared bit is asserted. Bits 0/1 are ours (launch, VE3);
- * bits 2-7 belong to nobody on this install and must read INACTIVE, so the
- * default has them set. The old 0x03 left bits 2-7 cleared = asserted, i.e.
- * six phantom inputs presented to whatever the tune binds to them. */
-static volatile uint8_t s_remotePorts = 0xFFu;
+static volatile uint8_t s_remotePorts = 0x03u;   /* default: VE1 + launch released */
 static uint32_t s_extFrames      = 0;
 static uint32_t s_portsPollSeen  = 0;
 static uint32_t s_portsRespSent  = 0;
+static uint32_t s_txFailSeen     = 0;   /* twai_transmit() refused the reply */
 static uint32_t s_portsPollId    = 0;      /* wire ID of the ECU's ports poll */
 static uint32_t s_rspId          = 0;      /* wire ID we transmit back */
-static uint32_t s_lastPortsPollMs = 0;     /* when ECU last polled the port block */
-static uint16_t s_lastPortsVarOff = 0;     /* WHICH offset it asked for - the thing that was wrong */
-static bool s_pollAbsentWarned = false;    /* "ECU never asked" - once */
-static bool s_pollOkWarned      = false;    /* "poll seen, here's what it asked" - once */
+static uint32_t s_lastPortsPollMs = 0;     /* when ECU last polled Remote Port 3 */
 static uint32_t s_extSeen[8];
 static uint32_t s_extCnt[8];
 static uint8_t  s_extSeenN = 0;
@@ -241,86 +209,69 @@ static void can_rx_task(void *arg)
                     s_extSeenN++;
                 }
 
-                /* MS2/Extra ports poll request: MSG_REQ, 2-byte offset spec.
-                 * ADC polls request 8 bytes -> excluded by the DLC/shape test.
+                /* MS2/Extra ports poll request: MSG_REQ, reply-to table 7, 2 bytes
+                 * requested (ADC polls request 8 bytes -> excluded by mask).
+                 * Only answer the Remote Port 3 poll (var_off == 167 = gpioport[2]).
                  *
-                 * THREE bugs lived here, each of which alone kept launch + the
-                 * VE3 sports-table switch dead while the code compiled clean and
-                 * the Polls=/Resp= counters still printed:
+                 * SENDER GUARD: extended frame 0x9990570 only.
                  *
-                 * 1. `msg.identifier == 0x5F0` inside `if (msg.extd)`. 0x5F0 is a
-                 *    STANDARD id, so no frame could ever satisfy both - the
-                 *    responder was dead on arrival. 0x5F0 is the ECU's *outpc
-                 *    broadcast*, the very id this firmware reads gauges from.
+                 * This used to read `msg.identifier == 0x5F0`, which was
+                 * UNSATISFIABLE and silently killed the whole responder: the
+                 * enclosing block only runs `if (msg.extd)`, and 0x5F0 is a
+                 * STANDARD id, so no frame can ever match both. That made
+                 * launch-arm and the VE3 sports-table switch dead on the car
+                 * while the code still compiled and the counters still printed.
+                 * 0x5F0 is the ECU's *outpc broadcast* id, not its poll id.
+                 * The poll is the 29-bit EXTENDED 0x9990570 (DLC3 07 14 E2),
+                 * verified against ms2extra-3.4.3 CanRxIsr. The bus is
+                 * unauthenticated, so matching the exact poll id is also the
+                 * anti-spoof check — the other polls (0x590570 ADC03, 0x690570
+                 * ADC47, 0x1E10570 PWM) all share the low 16 bits 0x0570 and are
+                 * separated only by the high bits, so the full id is required.
                  *
-                 * 2. `var_off == 167` was labelled "gpioport[2] = Remote Port 3".
-                 *    The INI says gpioport1 = 167 and gpioport2 = 168, and the
-                 *    tune reads Remote Port3 Bit 0/1 = gpioport2. The reply was
-                 *    landing one port to the left of the reader.
-                 *
-                 * 3. The payload was hardcoded to 2 bytes with our byte at
-                 *    data[1], which only coincides with gpioport2 if the ECU
-                 *    happens to poll 167. Answering whichever member is polled
-                 *    fixes it for all three.
-                 *
-                 * Every ports-shaped poll is now answered by offset, and an
-                 * offset outside the block is named on the console instead of
-                 * being dropped - the previous "expected 0x9990570" warning
-                 * could only fire on a correct offset, so a wrong poll shape
-                 * produced no output whatsoever. */
+                 * If that id is ever wrong, the mismatch line below names the
+                 * real one instead of leaving the responder quietly dead. */
                 if (msg.data_length_code >= 3 && msg.data[0] == 7 && (msg.data[2] & 0x1F) == 2) {
-                    uint16_t var_off = (uint16_t)(((uint32_t)msg.data[1] << 3) | (msg.data[2] >> 5));
-
-                    if (var_off < kGpioPortOff0 || var_off >= kGpioPortOff0 + kGpioPortOffN) {
-                        /* Not a port we know how to fill. Say so once per
-                         * distinct (id, offset) so the assumption is visible
-                         * rather than silently wrong. */
-                        static uint32_t s_badOff[4], s_badId[4];
-                        static uint8_t  s_badN = 0;
-                        bool known = false;
-                        for (uint8_t i = 0; i < s_badN; i++)
-                            if (s_badOff[i] == var_off && s_badId[i] == msg.identifier) { known = true; break; }
-                        if (!known && s_badN < 4) {
-                            s_badOff[s_badN] = var_off; s_badId[s_badN] = msg.identifier; s_badN++;
-                            printf("[CAN] ports poll UNHANDLED: id=0x%X var_off=%u (block is %u..%u)\n",
-                                   (unsigned)msg.identifier, var_off,
-                                   kGpioPortOff0, kGpioPortOff0 + kGpioPortOffN - 1);
-                        }
-                    } else if (msg.identifier != kPortsPollId) {
+                    uint32_t var_off = ((uint32_t)msg.data[1] << 3) | (msg.data[2] >> 5);
+                    if (var_off == 167 && msg.identifier != kPortsPollId) {
+                        /* Data says Remote Port 3 poll, id says otherwise. Once,
+                         * then stay quiet — this is the only diagnostic that can
+                         * tell us the id assumption is stale. */
                         static bool s_pollIdWarned = false;
                         if (!s_pollIdWarned) {
                             s_pollIdWarned = true;
                             printf("[CAN] ports poll id UNEXPECTED: got 0x%X expected 0x%X "
-                                   "(var_off=%u IS a known port) - not answering\n",
-                                   (unsigned)msg.identifier, (unsigned)kPortsPollId, var_off);
+                                   "- responder will NOT answer until this is corrected\n",
+                                   (unsigned)msg.identifier, (unsigned)kPortsPollId);
                         }
-                    } else {
+                    }
+                    if (var_off == 167 && msg.identifier == kPortsPollId) {  /* Remote Port 3 = gpioport[2] */
                         s_portsPollSeen++;
                         s_lastPortsPollMs = esp_timer_get_time() / 1000;
                         if (s_portsPollId == 0) s_portsPollId = msg.identifier;
-                        s_lastPortsVarOff = var_off;
-                        /* Response wire ID: var_off=[28:18], msg_type=3 (MSG_RSP),
-                         * From=0, var_blk=0x70 -> 0x29D8070 for offset 167.
-                         * msg_type=2/From=5/var_blk=0x38 produced 0x29C38038,
-                         * which the ECU never saw. */
-                        uint32_t rsp_id = ((uint32_t)var_off & 0x7FFu) << 18;
+                        /* Response wire ID: var_off=ID[28:18], msg_type=3, From=0, var_blk=0x70
+                         * Verified against the ECU's expected response ID 0x29D8070.
+                         * Previously used msg_type=2, From=5, var_blk=0x38 which produced
+                         * 0x29C38038 — the ECU never saw the response. */
+                        uint32_t rsp_id = (var_off & 0x7FFu) << 18;
                         rsp_id |= 3u << 15;   /* msg_type = 3 (MSG_RSP) */
                         rsp_id |= 0u << 11;   /* From = 0 */
                         rsp_id |= 0x70u;     /* var_blk = 0x70 */
-                        /* Byte k carries gpioport(k). We drive gpioport2 only;
-                         * the others sit at their idle value. Fill from the
-                         * polled offset so the reply is correct for 166, 167
-                         * and 168 alike instead of assuming 167. */
-                        const uint8_t gpio[3] = { 0xFF, 0xFF, (uint8_t)s_remotePorts };
                         twai_message_t rsp = {0};
                         rsp.identifier = rsp_id;
                         rsp.extd = true;
-                        rsp.data_length_code = (uint8_t)(kGpioPortOff0 + kGpioPortOffN - var_off);
-                        for (uint8_t i = 0; i < rsp.data_length_code; i++)
-                            rsp.data[i] = gpio[(var_off - kGpioPortOff0) + i];
+                        rsp.data_length_code = 2;
+                        rsp.data[0] = 0x00;                   /* gpioport[1] unused */
+                        rsp.data[1] = (uint8_t)s_remotePorts; /* gpioport[2] = Remote Port3 */
                         if (twai_transmit(&rsp, pdMS_TO_TICKS(10)) == ESP_OK) {
                             s_portsRespSent++;
                             s_rspId = rsp_id;
+                        } else {
+                            /* Silent failure is the other half of the problem:
+                             * the responder could be firing every 10 ms and
+                             * transmitting nothing, and Resp= would just stay
+                             * at 0 looking identical to "never polled". */
+                            s_txFailSeen++;
                         }
                     }
                 }
@@ -335,29 +286,39 @@ static void can_rx_task(void *arg)
             s_stats.last_sec_frame_count = s_stats.total_frames;
             s_stats.last_sec_time_ms = now_ms;
             printf("[CAN] Stats: FPS=%" PRIu32 " Total=%" PRIu32 " Err=%" PRIu32 " BusOff=%" PRIu32
-                   " Ext=%" PRIu32 " Polls=%" PRIu32 " Resp=%" PRIu32 " off=%u Spd=%" PRIu32 "\n",
+                   " Ext=%" PRIu32 " Polls=%" PRIu32 " Resp=%" PRIu32 " txfail=%" PRIu32 " Spd=%" PRIu32 "\n",
                      fps, s_stats.total_frames,
                      s_stats.error_frames, s_stats.bus_off_count,
-                     s_extFrames, s_portsPollSeen, s_portsRespSent,
-                     s_lastPortsVarOff, (uint32_t)can_rx_get_speed());
-            /* Polls>0 with Resp==0 is not reachable - the reply is the only thing
-             * that increments either. The diagnostic that matters is Ext>0 with
-             * Polls stuck at 0: the ECU is on the bus and is NOT asking for the
-             * ports, so enable_pollports / can_poll / ports_dir are not live in
-             * the ECU's own tune. Name it, because a bare counter reads the same
-             * whether we answered and it did not land, or the ECU never asked. */
-            if (s_extFrames > 20 && s_portsPollSeen == 0 && !s_pollAbsentWarned) {
-                s_pollAbsentWarned = true;
-                printf("[CAN] NO ports poll in %" PRIu32 " extended frames - the ECU is "
-                       "talking but is not asking for the remote ports. Check "
-                       "enable_pollports / can_poll / ports_dir are BURNED in the "
-                       "ECU; a .msq on the stick is not what the ECU is running.\n",
-                       s_extFrames);
-            } else if (s_portsPollSeen > 0 && !s_pollOkWarned) {
+                     s_extFrames, s_portsPollSeen, s_portsRespSent, s_txFailSeen,
+                      (uint32_t)can_rx_get_speed());
+            /* Diagnostics only - the wire format above is unchanged.
+             *
+             * The counters alone cannot separate the three states this can be
+             * in, and that is why it stayed broken across three rounds:
+             *   Ext>0, Polls=0  -> the ECU is on the bus but is NOT asking for
+             *                       the remote ports. Not a dash problem.
+             *   Polls>0, Resp=0 -> twai_transmit() is failing. Transceiver or
+             *                       bus. txfail says so explicitly.
+             *   Polls>0, Resp>0 -> the dash is answering correctly and the bits
+             *                       are not landing. Then it is the ECU side.
+             * Report the first two once; the third is already obvious. */
+            static bool s_noPollWarned = false, s_txFailWarned = false, s_pollOkWarned = false;
+            if (s_extFrames > 20 && s_portsPollSeen == 0 && !s_noPollWarned) {
+                s_noPollWarned = true;
+                printf("[CAN] DIAG: %" PRIu32 " extended frames, ZERO ports polls. The ECU is "
+                       "transmitting but never requests the remote ports, so the dash "
+                       "cannot answer. Not a dash-side fault.\n", s_extFrames);
+            }
+            if (s_txFailSeen && !s_txFailWarned) {
+                s_txFailWarned = true;
+                printf("[CAN] DIAG: %" PRIu32 " ports replies FAILED to transmit (no ACK / "
+                       "bus error). The responder is firing but nothing is reaching the "
+                       "wire - transceiver, its enable, or termination.\n", s_txFailSeen);
+            }
+            if (s_portsPollSeen > 0 && !s_pollOkWarned) {
                 s_pollOkWarned = true;
-                printf("[CAN] ports poll LIVE: var_off=%u, replied DLC=%u\n",
-                       s_lastPortsVarOff,
-                       (unsigned)(kGpioPortOff0 + kGpioPortOffN - s_lastPortsVarOff));
+                printf("[CAN] DIAG: ports poll live, replying id=0x%X var_off=167 DLC=2 "
+                       "(steady 00 03).\n", (unsigned)s_rspId);
             }
         }
 
